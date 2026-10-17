@@ -13,7 +13,14 @@ import {
   fleetRefBranch,
   stageFleetRefFromBundle,
   landFleetRef,
+  reconcileGossipSync,
+  createSshGossipTransport,
+  freePoolArtifactPath,
+  burnRunsDirPath,
+  type GossipArtifactTransport,
+  type GossipPeerDigest,
 } from "../src/git-sync.ts";
+import type { FleetNode, FleetPulse } from "../src/fleet.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -451,5 +458,251 @@ describe("landFleetRef (explicit operator Land)", () => {
       () => landFleetRef({ repoPath: repo, nodeId: "win-wsl", runOrTaskId: "run-99" }),
       /refs\/fleet\/win-wsl\/run-99/,
     );
+  });
+});
+
+describe("reconcileGossipSync (last-write-wins Gossip sync)", () => {
+  const T0 = "2026-10-17T09:00:00.000Z";
+  const T1 = "2026-10-17T10:00:00.000Z";
+  const T2 = "2026-10-17T11:00:00.000Z";
+
+  function peerNode(id: string): FleetNode {
+    return {
+      id,
+      name: id,
+      posture: "stationary",
+      transport: "ssh",
+      sshTarget: `ssh://andrew@100.101.102.103`,
+      remotePaseoHome: "/home/andrew/.paseo-factory",
+      slotCeiling: 2,
+      reserveMode: false,
+      healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 },
+    };
+  }
+
+  function pulseOf(nodeId: string, stamps: { freePool?: string | null; runs?: string | null }): FleetPulse {
+    return {
+      nodeId,
+      online: true,
+      cpuPercent: 10,
+      freeMemMb: 8192,
+      activeAgents: 0,
+      activeBurnRuns: 0,
+      meterSummary: null,
+      freePoolUpdatedAt: stamps.freePool ?? null,
+      runsUpdatedAt: stamps.runs ?? null,
+      collectedAt: T2,
+    };
+  }
+
+  /** Local home holding a free-pool at T1 and one completed run at T1. */
+  function gossipHome(): string {
+    const home = makeTempDir("git-sync-gossip");
+    mkdirSync(join(home, "burn-lab", "runs"), { recursive: true });
+    writeFileSync(
+      freePoolArtifactPath(home),
+      JSON.stringify({ updatedAt: T1, models: [{ id: "local-model" }] }),
+      "utf8",
+    );
+    writeFileSync(
+      join(burnRunsDirPath(home), "run-local.json"),
+      JSON.stringify({ id: "run-local", updatedAt: T1, status: "completed" }),
+      "utf8",
+    );
+    return home;
+  }
+
+  /** In-memory peer: path → content; records every read for assertions. */
+  function makeTransport(files: Record<string, string>, runListing: string[]): {
+    transport: GossipArtifactTransport;
+    reads: string[];
+    listed: string[];
+  } {
+    const reads: string[] = [];
+    const listed: string[] = [];
+    const transport: GossipArtifactTransport = {
+      readFile: async (_node, relativePath) => {
+        reads.push(relativePath);
+        return files[relativePath] ?? null;
+      },
+      listFiles: async (_node, relativeDir) => {
+        listed.push(relativeDir);
+        return runListing;
+      },
+    };
+    return { transport, reads, listed };
+  }
+
+  it("pulls a peer's newer free-pool.json (LWW) and leaves older/stale peers alone", async () => {
+    const home = gossipHome();
+    const newerPool = JSON.stringify({ updatedAt: T2, models: [{ id: "peer-model" }] });
+    const { transport, reads } = makeTransport(
+      { "burn-lab/free-pool.json": newerPool },
+      [],
+    );
+
+    const report = await reconcileGossipSync({
+      paseoHome: home,
+      peers: [
+        { node: peerNode("newer-peer"), pulse: pulseOf("newer-peer", { freePool: T2 }) },
+        { node: peerNode("older-peer"), pulse: pulseOf("older-peer", { freePool: T0 }) },
+        { node: peerNode("no-stamp-peer"), pulse: pulseOf("no-stamp-peer", {}) },
+      ],
+      transport,
+    });
+
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0], "burn-lab/free-pool.json");
+    assert.deepEqual(report.freePool, [{ nodeId: "newer-peer", updatedAt: T2 }]);
+    const pulled = JSON.parse(readFileSync(freePoolArtifactPath(home), "utf8"));
+    assert.equal(pulled.updatedAt, T2);
+    assert.deepEqual(pulled.models, [{ id: "peer-model" }]);
+  });
+
+  it("pulls newer completed BurnRunRecords and their report.md when the peer's runsUpdatedAt is newer", async () => {
+    const home = gossipHome();
+    const peerRecord = JSON.stringify({
+      id: "run-42",
+      updatedAt: T2,
+      status: "completed",
+      winningModel: "peer-model",
+    });
+    const staleLocalCopy = JSON.stringify({ id: "run-local", updatedAt: T0, status: "completed" });
+    const { transport, reads } = makeTransport(
+      {
+        "burn-lab/runs/run-42.json": peerRecord,
+        "burn-lab/runs/run-local.json": staleLocalCopy,
+        "burn-lab/runs/run-42/report.md": "# Peer report\n",
+      },
+      ["run-42.json", "run-local.json"],
+    );
+
+    const report = await reconcileGossipSync({
+      paseoHome: home,
+      peers: [{ node: peerNode("mac-studio"), pulse: pulseOf("mac-studio", { runs: T2 }) }],
+      transport,
+    });
+
+    // Only the genuinely newer record and its report are pulled; the peer's
+    // older copy of run-local is left alone.
+    assert.deepEqual(reads, [
+      "burn-lab/runs/run-42.json",
+      "burn-lab/runs/run-42/report.md",
+      "burn-lab/runs/run-local.json",
+    ]);
+    assert.deepEqual(report.runs, [{ nodeId: "mac-studio", runId: "run-42", updatedAt: T2 }]);
+
+    const local42 = JSON.parse(readFileSync(join(burnRunsDirPath(home), "run-42.json"), "utf8"));
+    assert.equal(local42.winningModel, "peer-model");
+    assert.equal(
+      readFileSync(join(burnRunsDirPath(home), "run-42", "report.md"), "utf8"),
+      "# Peer report\n",
+    );
+    const localOwn = JSON.parse(readFileSync(join(burnRunsDirPath(home), "run-local.json"), "utf8"));
+    assert.equal(localOwn.updatedAt, T1);
+  });
+
+  it("pulls run records into a home that has no runs yet (bootstrap)", async () => {
+    const home = makeTempDir("git-sync-gossip-empty");
+    const peerRecord = JSON.stringify({ id: "run-7", updatedAt: T1, status: "completed" });
+    const { transport } = makeTransport(
+      { "burn-lab/runs/run-7.json": peerRecord },
+      ["run-7.json"],
+    );
+
+    const report = await reconcileGossipSync({
+      paseoHome: home,
+      peers: [{ node: peerNode("win-wsl"), pulse: pulseOf("win-wsl", { runs: T1 }) }],
+      transport,
+    });
+
+    assert.deepEqual(report.runs, [{ nodeId: "win-wsl", runId: "run-7", updatedAt: T1 }]);
+    assert.ok(existsSync(join(burnRunsDirPath(home), "run-7.json")));
+  });
+
+  it("touches no artifacts when no peer digest advertises newer stamps", async () => {
+    const home = gossipHome();
+    const { transport, reads, listed } = makeTransport({}, []);
+
+    const report = await reconcileGossipSync({
+      paseoHome: home,
+      peers: [
+        { node: peerNode("even-peer"), pulse: pulseOf("even-peer", { freePool: T1, runs: T1 }) },
+      ],
+      transport,
+    });
+
+    assert.deepEqual(report.freePool, []);
+    assert.deepEqual(report.runs, []);
+    assert.deepEqual(reads, []);
+    assert.deepEqual(listed, []);
+    const pool = JSON.parse(readFileSync(freePoolArtifactPath(home), "utf8"));
+    assert.equal(pool.updatedAt, T1);
+  });
+});
+
+describe("SSH gossip transport (createSshGossipTransport)", () => {
+  function gossipNode(): FleetNode {
+    return {
+      id: "mac-studio",
+      name: "Mac Studio",
+      posture: "stationary",
+      transport: "ssh",
+      sshTarget: "ssh://andrew@100.101.102.103",
+      remotePaseoHome: "/home/andrew/.paseo-factory",
+      slotCeiling: 2,
+      reserveMode: false,
+      healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 },
+    };
+  }
+
+  it("reads peer artifacts over BatchMode SSH via the injected runner", async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner = {
+      run: async (command: string, args: string[]) => {
+        calls.push({ command, args });
+        return { stdout: "file bytes\n", stderr: "" };
+      },
+    };
+    const transport = createSshGossipTransport({ runner });
+
+    const content = await transport.readFile(gossipNode(), "burn-lab/free-pool.json");
+    assert.equal(content, "file bytes\n");
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, "ssh");
+    const args = calls[0].args;
+    assert.ok(args.includes("BatchMode=yes"));
+    assert.ok(args.includes("ConnectTimeout=5"));
+    assert.ok(args.includes("andrew@100.101.102.103"));
+    assert.equal(args[args.length - 1], "cat /home/andrew/.paseo-factory/burn-lab/free-pool.json");
+  });
+
+  it("returns null for a missing peer file and [] for an unreadable directory instead of failing gossip", async () => {
+    const runner = {
+      run: async (command: string, args: string[]) => {
+        if (args[args.length - 1].startsWith("ls")) {
+          throw new Error("ssh: connection lost");
+        }
+        return { stdout: "", stderr: "" };
+      },
+    };
+    const transport = createSshGossipTransport({ runner });
+
+    // `cat` of a missing file exits non-zero on the peer → readFile maps to null.
+    const missing = await transport.readFile(gossipNode(), "burn-lab/runs/ghost.json");
+    assert.equal(missing, null);
+
+    const listing = await transport.listFiles(gossipNode(), "burn-lab/runs");
+    assert.deepEqual(listing, []);
+  });
+
+  it("lists a peer directory's files from `ls -1` output", async () => {
+    const runner = {
+      run: async () => ({ stdout: "run-42.json\nrun-local.json\n", stderr: "" }),
+    };
+    const transport = createSshGossipTransport({ runner });
+    const files = await transport.listFiles(gossipNode(), "burn-lab/runs");
+    assert.deepEqual(files, ["run-42.json", "run-local.json"]);
   });
 });

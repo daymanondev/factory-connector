@@ -19,10 +19,17 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { execCommandRunner, type CommandRunner, type FleetNode, type FleetPulse } from "./fleet.ts";
+import {
+  DEFAULT_REMOTE_PASEO_HOME,
+  execCommandRunner,
+  parseSshTarget,
+  type CommandRunner,
+  type FleetNode,
+  type FleetPulse,
+} from "./fleet.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -387,4 +394,241 @@ export async function landFleetRef(options: {
 
   const headAfter = (await runGit(runner, options.repoPath, ["rev-parse", "HEAD"])).trim();
   return { branch, commit: mode === "checkout" ? commit : headAfter, mode };
+}
+
+/**
+ * `Gossip sync` — last-write-wins reconciliation of shared fleet artifacts
+ * from `Fleet pulse` timestamps (CONTEXT.md "Gossip sync"). Pull-only per
+ * peer: every `Node` runs the same reconciliation against the peers it can
+ * reach, so newer artifacts propagate without a master.
+ */
+
+/** Local path of the `free-pool.json` shared with `factory-burn-lab`. */
+export function freePoolArtifactPath(paseoHome: string): string {
+  return join(paseoHome, "burn-lab", "free-pool.json");
+}
+
+/** Local directory of completed `BurnRunRecord` JSON files and artifacts. */
+export function burnRunsDirPath(paseoHome: string): string {
+  return join(paseoHome, "burn-lab", "runs");
+}
+
+/** Peer-relative path of `free-pool.json` (POSIX on every `Node`'s runtime). */
+export const FREE_POOL_RELATIVE_PATH = "burn-lab/free-pool.json";
+
+/** Peer-relative directory of completed run records and artifacts. */
+export const BURN_RUNS_RELATIVE_DIR = "burn-lab/runs";
+
+/** A peer's digest paired with the `Node` it came from. */
+export interface GossipPeerDigest {
+  node: FleetNode;
+  pulse: FleetPulse;
+}
+
+/**
+ * Injectable seam for reading shared artifacts off a peer `Node`.
+ * Production default is Tailscale SSH (`createSshGossipTransport`); tests
+ * pass an in-memory stub so nothing here ever touches the network.
+ */
+export interface GossipArtifactTransport {
+  /** Reads one artifact (UTF-8) relative to the peer's `<paseoHome>`; null when absent. */
+  readFile(node: FleetNode, relativePath: string): Promise<string | null>;
+  /** Lists file names directly inside a peer-relative directory (empty when unreadable). */
+  listFiles(node: FleetNode, relativeDir: string): Promise<string[]>;
+}
+
+/** One `free-pool.json` pulled from a peer because its stamp was newer. */
+export interface GossipFreePoolPull {
+  nodeId: string;
+  updatedAt: string;
+}
+
+/** One completed `BurnRunRecord` (and its artifacts) pulled from a peer. */
+export interface GossipRunPull {
+  nodeId: string;
+  runId: string;
+  updatedAt: string;
+}
+
+/** What a `reconcileGossipSync` pass actually reconciled. */
+export interface GossipSyncReport {
+  freePool: GossipFreePoolPull[];
+  runs: GossipRunPull[];
+}
+
+function parseStampMs(stamp: string | null | undefined): number {
+  if (typeof stamp !== "string") return 0;
+  const ms = Date.parse(stamp);
+  return Number.isNaN(ms) ? 0 : ms;
+}
+
+function readLocalFreePoolStamp(paseoHome: string): number {
+  try {
+    const parsed = JSON.parse(readFileSync(freePoolArtifactPath(paseoHome), "utf8")) as {
+      updatedAt?: unknown;
+    };
+    return parseStampMs(typeof parsed.updatedAt === "string" ? parsed.updatedAt : undefined);
+  } catch {
+    return 0;
+  }
+}
+
+function readLocalRunStamps(paseoHome: string): Map<string, string> {
+  const stamps = new Map<string, string>();
+  const dir = burnRunsDirPath(paseoHome);
+  let files: string[];
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return stamps;
+  }
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, file), "utf8")) as {
+        id?: unknown;
+        updatedAt?: unknown;
+      };
+      if (typeof parsed.updatedAt === "string") {
+        stamps.set(file.replace(/\.json$/, ""), parsed.updatedAt);
+      }
+    } catch {
+      // A malformed local record never blocks gossip; it simply looks oldest.
+    }
+  }
+  return stamps;
+}
+
+function writeArtifact(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, content, "utf8");
+}
+
+/**
+ * Compares `freePoolUpdatedAt` / `runsUpdatedAt` stamps carried by `Fleet
+ * pulse` digests against the local artifacts and pulls, last-write-wins, every
+ * peer artifact that is strictly newer: the peer's `free-pool.json` and its
+ * completed `BurnRunRecord` JSON plus each pulled run's `report.md` summary.
+ * Peers that are not newer, offline, or carry null stamps cost nothing — no
+ * transport reads at all.
+ */
+export async function reconcileGossipSync(options: {
+  paseoHome: string;
+  peers: GossipPeerDigest[];
+  transport: GossipArtifactTransport;
+}): Promise<GossipSyncReport> {
+  const report: GossipSyncReport = { freePool: [], runs: [] };
+  let localFreePoolStamp = readLocalFreePoolStamp(options.paseoHome);
+  const localRunStamps = readLocalRunStamps(options.paseoHome);
+  let localRunsMax = Math.max(0, ...[...localRunStamps.values()].map((stamp) => parseStampMs(stamp)));
+
+  for (const { node, pulse } of options.peers) {
+    if (parseStampMs(pulse.freePoolUpdatedAt) > localFreePoolStamp) {
+      const content = await options.transport.readFile(node, FREE_POOL_RELATIVE_PATH);
+      if (content !== null) {
+        writeArtifact(freePoolArtifactPath(options.paseoHome), content);
+        report.freePool.push({ nodeId: node.id, updatedAt: pulse.freePoolUpdatedAt as string });
+        localFreePoolStamp = parseStampMs(pulse.freePoolUpdatedAt);
+      }
+    }
+
+    if (parseStampMs(pulse.runsUpdatedAt) > localRunsMax) {
+      const listing = await options.transport.listFiles(node, BURN_RUNS_RELATIVE_DIR);
+      for (const file of listing) {
+        if (!file.endsWith(".json")) continue;
+        const runId = file.replace(/\.json$/, "");
+        const recordPath = `${BURN_RUNS_RELATIVE_DIR}/${file}`;
+        const content = await options.transport.readFile(node, recordPath);
+        if (content === null) continue;
+        let peerStamp: string | null = null;
+        try {
+          const parsed = JSON.parse(content) as { updatedAt?: unknown };
+          if (typeof parsed.updatedAt === "string") peerStamp = parsed.updatedAt;
+        } catch {
+          continue; // an unparsable peer record cannot be ordered — skip it
+        }
+        if (peerStamp === null) continue;
+        const localStamp = localRunStamps.get(runId);
+        if (parseStampMs(peerStamp) <= parseStampMs(localStamp)) continue;
+
+        writeArtifact(join(burnRunsDirPath(options.paseoHome), file), content);
+        const reportPath = `${BURN_RUNS_RELATIVE_DIR}/${runId}/report.md`;
+        const reportContent = await options.transport.readFile(node, reportPath);
+        if (reportContent !== null) {
+          writeArtifact(join(burnRunsDirPath(options.paseoHome), runId, "report.md"), reportContent);
+        }
+        report.runs.push({ nodeId: node.id, runId, updatedAt: peerStamp });
+        localRunStamps.set(runId, peerStamp);
+        localRunsMax = Math.max(localRunsMax, parseStampMs(peerStamp));
+      }
+    }
+  }
+
+  return report;
+}
+
+/** Timeout ceiling for one SSH artifact read during `Gossip sync`. */
+export const GOSSIP_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Production `GossipArtifactTransport`: reads artifacts from a peer `Node`
+ * over Tailscale SSH in BatchMode (digest-first — summaries only, never token
+ * or gate-log streaming, ADR 0001 §3).
+ */
+export function createSshGossipTransport(options?: {
+  runner?: CommandRunner;
+  connectTimeoutSeconds?: number;
+}): GossipArtifactTransport {
+  const runner = options?.runner ?? execCommandRunner;
+  const connectTimeout = options?.connectTimeoutSeconds ?? 5;
+
+  function remotePath(node: FleetNode, relativePath: string): string {
+    const remoteHome = node.remotePaseoHome ?? DEFAULT_REMOTE_PASEO_HOME;
+    return `${remoteHome}/${relativePath}`;
+  }
+
+  async function ssh(node: FleetNode, remoteCommand: string): Promise<string> {
+    if (!node.sshTarget) {
+      throw new Error(`factory-connector: Node ${node.id} has no sshTarget to gossip with`);
+    }
+    const { user, host } = parseSshTarget(node.sshTarget);
+    const destination = user ? `${user}@${host}` : host;
+    const { stdout } = await runner.run(
+      "ssh",
+      [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        `ConnectTimeout=${connectTimeout}`,
+        destination,
+        remoteCommand,
+      ],
+      { timeoutMs: GOSSIP_FETCH_TIMEOUT_MS },
+    );
+    return stdout;
+  }
+
+  return {
+    async readFile(node, relativePath) {
+      try {
+        const stdout = await ssh(node, `cat ${remotePath(node, relativePath)}`);
+        // A missing file surfaces as a non-zero `cat` exit (thrown) or an
+        // empty read; either way there is no artifact to reconcile.
+        return stdout.trim() === "" ? null : stdout;
+      } catch {
+        return null;
+      }
+    },
+    async listFiles(node, relativeDir) {
+      try {
+        const stdout = await ssh(node, `ls -1 ${remotePath(node, relativeDir)}`);
+        return stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line !== "");
+      } catch {
+        return [];
+      }
+    },
+  };
 }
