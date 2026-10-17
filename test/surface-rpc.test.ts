@@ -650,3 +650,112 @@ describe("connector.gossip.sync", () => {
     assert.deepEqual(again.report, { freePool: [], runs: [] });
   });
 });
+
+describe("connector.ref.land", () => {
+  it("applies a staged Fleet ref via checkout through the surface", async () => {
+    const home = makeTempHome("land");
+    seedRegistry(home, []);
+    // The initiating repo plus a peer's completion bundle staged under refs/fleet.
+    const repo = await initRepo(join(makeTempDir("land-repo"), "proj"));
+    writeFileSync(join(repo, "file.txt"), "base\n", "utf8");
+    const base = await commitAll(repo, "base");
+    const peer = join(makeTempDir("land-peer"), "proj");
+    await execFileAsync("git", ["clone", "-q", repo, peer]);
+    writeFileSync(join(peer, "file.txt"), "peer-wins\n", "utf8");
+    await execFileAsync("git", ["-C", peer, "commit", "-aqm", "peer completion"]);
+    const bundle = await createCommitBundle({
+      repoPath: peer,
+      base,
+      outPath: join(makeTempDir("land-bundle"), "completion.bundle"),
+    });
+    await stageFleetRefFromBundle({
+      repoPath: repo,
+      bundlePath: bundle.bundlePath,
+      nodeId: "studio-a",
+      runOrTaskId: "run-42",
+    });
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.refLand({
+      repoPath: repo,
+      nodeId: "studio-a",
+      runOrTaskId: "run-42",
+      mode: "checkout",
+    });
+
+    assert.equal(reply.ok, true, reply.ok ? "" : reply.error);
+    if (!reply.ok) return;
+    assert.equal(reply.landed.branch, "fleet/studio-a/run-42");
+    assert.equal(reply.landed.mode, "checkout");
+    assert.match(reply.landed.commit, /^[0-9a-f]{40}$/);
+    assert.equal((await git(repo, "rev-parse", "HEAD")).trim(), reply.landed.commit);
+  });
+
+  it("refuses as data when the Fleet ref is not staged in the repository", async () => {
+    const home = makeTempHome("land-missing");
+    seedRegistry(home, []);
+    const repo = await initRepo(join(makeTempDir("land-missing-repo"), "proj"));
+    writeFileSync(join(repo, "file.txt"), "base\n", "utf8");
+    await commitAll(repo, "base");
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.refLand({
+      repoPath: repo,
+      nodeId: "studio-a",
+      runOrTaskId: "run-404",
+    });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "land-failed");
+    assert.match(reply.error, /not staged/);
+  });
+});
+
+describe("connector.tailscale.discover", () => {
+  it("parses the tailnet the injected runner reports for the Node editor", async () => {
+    const home = makeTempHome("discover");
+    seedRegistry(home, []);
+    const statusJson = JSON.stringify({
+      Peer: {
+        "key-1": { HostName: "studio-a", DNSName: "studio-a.tail-net.ts.net.", TailscaleIPs: ["100.101.102.103"], Online: true, OS: "macOS" },
+        "key-2": { HostName: "wsl-box", DNSName: "wsl-box.tail-net.ts.net.", TailscaleIPs: ["100.101.102.104"], Online: false, OS: "linux" },
+      },
+    });
+    const handlers = makeHandlers(home, {
+      discoveryRunner: {
+        async run() {
+          return { stdout: statusJson, stderr: "" };
+        },
+      },
+    });
+
+    const reply = await handlers.tailscaleDiscover({});
+
+    assert.equal(reply.ok, true);
+    if (!reply.ok) return;
+    assert.deepEqual(reply.peers, [
+      { id: "studio-a", name: "studio-a", dnsName: "studio-a.tail-net.ts.net", tailscaleIp: "100.101.102.103", online: true, os: "macOS" },
+      { id: "wsl-box", name: "wsl-box", dnsName: "wsl-box.tail-net.ts.net", tailscaleIp: "100.101.102.104", online: false, os: "linux" },
+    ]);
+  });
+
+  it("refuses as data when the tailscale CLI is unavailable", async () => {
+    const home = makeTempHome("discover-fail");
+    seedRegistry(home, []);
+    const handlers = makeHandlers(home, {
+      discoveryRunner: {
+        async run() {
+          throw new Error("tailscale: command not found");
+        },
+      },
+    });
+
+    const reply = await handlers.tailscaleDiscover({});
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "discovery-failed");
+    assert.match(reply.error, /tailscale/);
+  });
+});

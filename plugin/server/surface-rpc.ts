@@ -11,6 +11,8 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import {
   defaultLocalPulseSource,
+  discoverTailscalePeers,
+  execCommandRunner,
   loadFleetConfig,
   loadFleetState,
   pollFleetPulse,
@@ -23,7 +25,7 @@ import {
   type LocalPulseSource,
   type PulseTransport,
 } from "./core/fleet.ts";
-import { createSshGossipTransport, reconcileGossipSync, type GossipArtifactTransport } from "./core/git-sync.ts";
+import { createSshGossipTransport, landFleetRef, reconcileGossipSync, type GossipArtifactTransport } from "./core/git-sync.ts";
 import {
   dispatchHandoff,
   executeBurst,
@@ -32,8 +34,8 @@ import {
   type RemoteCommandRunner,
 } from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { burst, gossipSync, handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
-import type { BurstReportView, FleetNodeInputView, FleetView, GossipSyncReportView, HandoffRecordView } from "../shared/view.ts";
+import { burst, gossipSync, handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, refLand, snapshot, tailscaleDiscover } from "../shared/rpc.ts";
+import type { BurstReportView, FleetNodeInputView, FleetView, GossipSyncReportView, HandoffRecordView, LandedFleetRefView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
 export interface SurfaceCallContext {
@@ -62,6 +64,8 @@ export interface SurfaceDeps {
   remoteRunner?: DispatchRemoteRunner;
   /** Local command runner for `Burst` on the local `Node` (tests stub it). */
   localRunner?: CommandRunner;
+  /** `tailscale status --json` runner for discovery (tests stub it). */
+  discoveryRunner?: CommandRunner;
   /** Daemon API for local activity counts, when the shell captured one. */
   daemon?: () => SurfaceDaemonApi | undefined;
   now?: () => Date;
@@ -270,6 +274,36 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         return failure("gossip-failed", messageOf(error));
       }
     },
+
+    async refLand(input: {
+      repoPath: string;
+      nodeId: string;
+      runOrTaskId: string;
+      mode?: "checkout" | "merge";
+    }) {
+      try {
+        const landed = await landFleetRef({
+          repoPath: input.repoPath,
+          nodeId: input.nodeId,
+          runOrTaskId: input.runOrTaskId,
+          mode: input.mode,
+        });
+        log(`ref.land: ${input.nodeId}/${input.runOrTaskId} → ${landed.branch} (${landed.mode})`);
+        return { ok: true as const, landed: landed as LandedFleetRefView };
+      } catch (error) {
+        return failure("land-failed", messageOf(error));
+      }
+    },
+
+    async tailscaleDiscover(_input: {}) {
+      try {
+        const peers = await discoverTailscalePeers(deps.discoveryRunner ?? execCommandRunner);
+        log(`tailscale.discover: ${peers.length} peer(s) visible`);
+        return { ok: true as const, peers };
+      } catch (error) {
+        return failure("discovery-failed", messageOf(error));
+      }
+    },
   };
 }
 
@@ -289,4 +323,6 @@ export function registerSurfaceRpc(server: PluginServerContext, handlers: Surfac
   server.handle(handoff, (input) => handlers.handoff(input));
   server.handle(burst, (input) => handlers.burst(input));
   server.handle(gossipSync, (input) => handlers.gossipSync(input));
+  server.handle(refLand, (input) => handlers.refLand(input));
+  server.handle(tailscaleDiscover, (input) => handlers.tailscaleDiscover(input));
 }

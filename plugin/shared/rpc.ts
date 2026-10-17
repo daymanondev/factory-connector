@@ -8,7 +8,7 @@
  */
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { BurstReportViewSchema, FleetNodeInputSchema, FleetViewSchema, GossipSyncReportViewSchema, HandoffKindSchema, HandoffRecordViewSchema } from "./view.ts";
+import { BurstReportViewSchema, FleetNodeInputSchema, FleetViewSchema, GossipSyncReportViewSchema, HandoffKindSchema, HandoffRecordViewSchema, LandedFleetRefViewSchema, LandFleetRefModeSchema } from "./view.ts";
 
 /** Every handler's refusal shape: a stable machine code plus the human sentence. */
 export const Failure = z.object({ ok: z.literal(false), code: z.string(), error: z.string() });
@@ -86,4 +86,37 @@ export const gossipSync = defineRpc({
   name: "connector.gossip.sync",
   input: z.object({}),
   output: z.union([z.object({ ok: z.literal(true), report: GossipSyncReportViewSchema }), Failure]),
+});
+
+export const refLand = defineRpc({
+  name: "connector.ref.land",
+  input: z.object({
+    /** Local repository the `Fleet ref` is staged in. */
+    repoPath: z.string().min(1),
+    nodeId: z.string().min(1),
+    runOrTaskId: z.string().min(1),
+    mode: LandFleetRefModeSchema.optional(),
+  }),
+  output: z.union([z.object({ ok: z.literal(true), landed: LandedFleetRefViewSchema }), Failure]),
+});
+
+export const tailscaleDiscover = defineRpc({
+  name: "connector.tailscale.discover",
+  input: z.object({}),
+  output: z.union([
+    z.object({
+      ok: z.literal(true),
+      peers: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          dnsName: z.string(),
+          tailscaleIp: z.string(),
+          online: z.boolean(),
+          os: z.string(),
+        }),
+      ),
+    }),
+    Failure,
+  ]),
 });

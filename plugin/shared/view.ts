@@ -154,3 +154,16 @@ export const GossipSyncReportViewSchema = z.object({
   runs: z.array(GossipRunPullSchema),
 });
 export type GossipSyncReportView = z.infer<typeof GossipSyncReportViewSchema>;
+
+/** How the operator asked a `Fleet ref` to be applied. */
+export const LandFleetRefModeSchema = z.enum(["checkout", "merge"]);
+
+/** Result of landing a staged `Fleet ref`. */
+export const LandedFleetRefViewSchema = z.object({
+  /** Local branch the `Fleet ref` was materialized as (`fleet/<nodeId>/<runId>`). */
+  branch: z.string(),
+  /** Commit landed at. */
+  commit: z.string(),
+  mode: LandFleetRefModeSchema,
+});
+export type LandedFleetRefView = z.infer<typeof LandedFleetRefViewSchema>;
