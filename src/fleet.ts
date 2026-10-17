@@ -513,3 +513,55 @@ export async function pollFleetPulse(options: {
   writeJsonAtomic(fleetStatePath(options.paseoHome), state);
   return state;
 }
+
+/** What the caller is selecting candidates for. */
+export type SelectionPurpose = "handoff" | "burst";
+
+export interface EligibilityQuery {
+  purpose: SelectionPurpose;
+  /** Keep only `stationary` `Node`s (`Handoff` with an auto-stationary target). */
+  requireStationary?: boolean;
+  /** `Node`s to skip, e.g. the initiating `Node` for a `Handoff`. */
+  excludeNodeIds?: string[];
+}
+
+/** An eligible candidate with its remaining `Slot ceiling` headroom. */
+export interface EligibleNode {
+  node: FleetNodeState;
+  freeSlots: number;
+}
+
+function passesHealthGuard(node: FleetNodeState): boolean {
+  return (
+    node.cpuPercent <= node.healthGuard.maxCpuPercent &&
+    node.freeMemMb >= node.healthGuard.minFreeMemMb
+  );
+}
+
+/**
+ * Filters and ranks candidate `Node`s for `Handoff` or `Burst` against the
+ * `Fleet pulse` snapshot. A `Node` is eligible when it is online, not in
+ * `Reserve mode`, inside its `Health guard` thresholds (inclusive), and below
+ * its `Slot ceiling`. Ranking: `stationary` before `mobile`, then most free
+ * slots, then lower CPU, then more free RAM — so `Handoff` naturally prefers
+ * `stationary` `Node`s and `Burst` spreads onto the roomiest machines first.
+ */
+export function selectEligibleNodes(state: FleetState, query: EligibilityQuery): EligibleNode[] {
+  const excluded = new Set(query.excludeNodeIds ?? []);
+  return state.nodes
+    .filter((node) => !excluded.has(node.nodeId))
+    .filter((node) => node.online)
+    .filter((node) => !node.reserveMode)
+    .filter((node) => passesHealthGuard(node))
+    .filter((node) => node.slotsInUse < node.slotCeiling)
+    .filter((node) => query.requireStationary !== true || node.posture === "stationary")
+    .map((node) => ({ node, freeSlots: node.slotCeiling - node.slotsInUse }))
+    .sort((a, b) => {
+      const postureRank = (entry: EligibleNode) => (entry.node.posture === "stationary" ? 0 : 1);
+      if (postureRank(a) !== postureRank(b)) return postureRank(a) - postureRank(b);
+      if (a.freeSlots !== b.freeSlots) return b.freeSlots - a.freeSlots;
+      if (a.node.cpuPercent !== b.node.cpuPercent) return a.node.cpuPercent - b.node.cpuPercent;
+      if (a.node.freeMemMb !== b.node.freeMemMb) return b.node.freeMemMb - a.node.freeMemMb;
+      return a.node.nodeId.localeCompare(b.node.nodeId);
+    });
+}

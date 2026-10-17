@@ -20,7 +20,9 @@ import {
   pollFleetPulse,
   loadFleetState,
   fleetStatePath,
+  selectEligibleNodes,
   type FleetState,
+  type FleetNodeState,
   type FleetPulse,
   type PulseTransport,
 } from "../src/fleet.ts";
@@ -388,5 +390,100 @@ describe("Fleet pulse polling (pollFleetPulse → fleet-state.json)", () => {
   it("loadFleetState returns null when no snapshot exists yet", () => {
     const home = makeTempHome();
     assert.equal(loadFleetState(home), null);
+  });
+});
+
+describe("candidate selection (selectEligibleNodes)", () => {
+  function nodeState(overrides: Partial<FleetNodeState> & { nodeId: string }): FleetNodeState {
+    return {
+      online: true,
+      cpuPercent: 10,
+      freeMemMb: 8192,
+      activeAgents: 0,
+      activeBurnRuns: 0,
+      meterSummary: null,
+      freePoolUpdatedAt: null,
+      runsUpdatedAt: null,
+      collectedAt: "2026-10-17T10:00:00.000Z",
+      name: overrides.nodeId,
+      posture: "stationary",
+      slotCeiling: 2,
+      reserveMode: false,
+      healthGuard: { ...DEFAULT_HEALTH_GUARD },
+      slotsInUse: 0,
+      lastError: null,
+      ...overrides,
+    };
+  }
+
+  function fleetOf(nodes: FleetNodeState[]): FleetState {
+    return { version: 1, localNodeId: "laptop", updatedAt: "2026-10-17T10:00:00.000Z", nodes };
+  }
+
+  it("drops offline, Reserve mode, Health guard violating, and slot-saturated Nodes", () => {
+    const state = fleetOf([
+      nodeState({ nodeId: "healthy" }),
+      nodeState({ nodeId: "offline", online: false }),
+      nodeState({ nodeId: "reserved", reserveMode: true }),
+      nodeState({ nodeId: "hot-cpu", cpuPercent: 99, healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 } }),
+      nodeState({ nodeId: "low-mem", freeMemMb: 512 }),
+      nodeState({ nodeId: "saturated", slotsInUse: 2, slotCeiling: 2 }),
+    ]);
+
+    const eligible = selectEligibleNodes(state, { purpose: "burst" });
+    assert.deepEqual(
+      eligible.map((entry) => entry.node.nodeId),
+      ["healthy"],
+    );
+    assert.equal(eligible[0].freeSlots, 2);
+  });
+
+  it("ranks stationary before mobile, then most free slots, then lower CPU, then more free RAM", () => {
+    const state = fleetOf([
+      nodeState({ nodeId: "mobile-idle", posture: "mobile", cpuPercent: 5, freeMemMb: 16384 }),
+      nodeState({ nodeId: "studio-busy", posture: "stationary", cpuPercent: 80, slotsInUse: 1, slotCeiling: 4 }),
+      nodeState({ nodeId: "studio-hot", posture: "stationary", cpuPercent: 40, slotCeiling: 4 }),
+      nodeState({ nodeId: "studio-cool", posture: "stationary", cpuPercent: 40, slotCeiling: 4, freeMemMb: 16384 }),
+    ]);
+
+    const eligible = selectEligibleNodes(state, { purpose: "handoff" });
+    // studio-cool vs studio-hot tie on posture/free slots/cpu → more free RAM wins;
+    // studio-busy ranks below both on free slots despite being more idle on CPU.
+    assert.deepEqual(
+      eligible.map((entry) => entry.node.nodeId),
+      ["studio-cool", "studio-hot", "studio-busy", "mobile-idle"],
+    );
+  });
+
+  it("honours requireStationary (auto-stationary Handoff) and excludeNodeIds (the initiator)", () => {
+    const state = fleetOf([
+      nodeState({ nodeId: "laptop", posture: "mobile" }),
+      nodeState({ nodeId: "studio-a", posture: "stationary" }),
+      nodeState({ nodeId: "studio-b", posture: "stationary", slotsInUse: 1, slotCeiling: 2 }),
+    ]);
+
+    const eligible = selectEligibleNodes(state, {
+      purpose: "handoff",
+      requireStationary: true,
+      excludeNodeIds: ["studio-a"],
+    });
+    assert.deepEqual(
+      eligible.map((entry) => entry.node.nodeId),
+      ["studio-b"],
+    );
+    assert.equal(eligible[0].freeSlots, 1);
+  });
+
+  it("treats Health guard boundaries as inclusive (at-threshold still eligible)", () => {
+    const state = fleetOf([
+      nodeState({
+        nodeId: "at-edge",
+        cpuPercent: 85,
+        freeMemMb: 2048,
+        healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 },
+      }),
+    ]);
+    const eligible = selectEligibleNodes(state, { purpose: "burst" });
+    assert.equal(eligible.length, 1);
   });
 });
