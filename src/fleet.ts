@@ -1,0 +1,149 @@
+/**
+ * Fleet registry, `Health guard`, and low-bandwidth `Fleet pulse` core.
+ *
+ * Owns the persistent peer `Fleet` registry (`<paseoHome>/connector/fleet.json`)
+ * and the live `Fleet pulse` snapshot (`<paseoHome>/connector/fleet-state.json`)
+ * that backs the `Fleet surface` UI and the `Connector bridge`.
+ *
+ * Pure Node module (mirrored verbatim into `plugin/server/core/` by
+ * `npm run sync:plugin-core`). Every network/SSH seam is injectable so tests
+ * run fully offline against temp directories.
+ */
+
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
+import { dirname, join } from "node:path";
+
+/** Physical availability classification of a `Node`. */
+export type NodePosture = "stationary" | "mobile";
+
+/** How a `Node` is reached from this machine: directly (local) or over Tailscale SSH. */
+export type NodeTransport = "local" | "ssh";
+
+/** CPU/RAM thresholds above which a `Node` refuses new delegated work. */
+export interface HealthGuard {
+  maxCpuPercent: number;
+  minFreeMemMb: number;
+}
+
+/** One machine registered in the `Fleet` registry. */
+export interface FleetNode {
+  id: string;
+  name: string;
+  posture: NodePosture;
+  transport: NodeTransport;
+  /** `ssh://user@100.x.y.z?daemonPort=6767` style Tailscale target (SSH nodes only). */
+  sshTarget?: string;
+  /** Daemon endpoint advertised by the `Node` (SSH nodes only). */
+  paseoEndpoint?: string;
+  /**
+   * `<paseoHome>` on the remote `Node` used to locate its `connector/` state
+   * over SSH. Defaults to `~/.paseo-factory` (the trial home per AGENTS.md).
+   */
+  remotePaseoHome?: string;
+  slotCeiling: number;
+  reserveMode: boolean;
+  healthGuard: HealthGuard;
+}
+
+/** Input accepted by `upsertNode`: identity + posture are required, the rest defaults. */
+export type FleetNodeInput = Pick<FleetNode, "id" | "name" | "posture"> &
+  Partial<Omit<FleetNode, "id" | "name" | "posture">>;
+
+/** Contents of `<paseoHome>/connector/fleet.json`. */
+export interface FleetConfig {
+  version: 1;
+  localNodeId: string;
+  nodes: FleetNode[];
+}
+
+export const FLEET_CONFIG_FILENAME = "fleet.json";
+export const FLEET_STATE_FILENAME = "fleet-state.json";
+
+/** `Slot ceiling` applied to newly registered `Node`s. */
+export const DEFAULT_SLOT_CEILING = 2;
+
+/** `Health guard` thresholds applied to newly registered `Node`s. */
+export const DEFAULT_HEALTH_GUARD: HealthGuard = {
+  maxCpuPercent: 85,
+  minFreeMemMb: 2048,
+};
+
+/** Remote home assumed when a `Node` does not carry `remotePaseoHome`. */
+export const DEFAULT_REMOTE_PASEO_HOME = "~/.paseo-factory";
+
+export function connectorDir(paseoHome: string): string {
+  return join(paseoHome, "connector");
+}
+
+export function fleetConfigPath(paseoHome: string): string {
+  return join(connectorDir(paseoHome), FLEET_CONFIG_FILENAME);
+}
+
+export function fleetStatePath(paseoHome: string): string {
+  return join(connectorDir(paseoHome), FLEET_STATE_FILENAME);
+}
+
+function slugifyHostName(host: string): string {
+  const slug = host
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.length > 0 ? slug : "local";
+}
+
+/**
+ * The `Node` entry every fresh registry starts from: this machine, reachable
+ * locally. Posture defaults to `mobile` — an unclassified machine is treated as
+ * one that may disconnect, which is the conservative scheduling default.
+ */
+export function defaultLocalNode(): FleetNode {
+  const host = hostname();
+  return {
+    id: slugifyHostName(host),
+    name: host,
+    posture: "mobile",
+    transport: "local",
+    slotCeiling: DEFAULT_SLOT_CEILING,
+    reserveMode: false,
+    healthGuard: { ...DEFAULT_HEALTH_GUARD },
+  };
+}
+
+export function defaultFleetConfig(): FleetConfig {
+  const local = defaultLocalNode();
+  return { version: 1, localNodeId: local.id, nodes: [local] };
+}
+
+function writeJsonAtomic(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  renameSync(tmp, path);
+}
+
+/**
+ * Loads the `Fleet` registry. A missing file yields the default config (single
+ * local `Node`) without writing anything; a corrupted file throws rather than
+ * silently resetting the operator's registered `Node`s.
+ */
+export function loadFleetConfig(paseoHome: string): FleetConfig {
+  const path = fleetConfigPath(paseoHome);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return defaultFleetConfig();
+  }
+  try {
+    return JSON.parse(raw) as FleetConfig;
+  } catch (error) {
+    throw new Error(
+      `factory-connector: corrupted fleet registry at ${path}: ${(error as Error).message}`,
+    );
+  }
+}
+
+export function saveFleetConfig(paseoHome: string, config: FleetConfig): void {
+  writeJsonAtomic(fleetConfigPath(paseoHome), config);
+}
