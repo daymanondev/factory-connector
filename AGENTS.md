@@ -12,6 +12,8 @@ Peer-to-peer multi-machine Tailscale mesh plugin (`factory-connector`) for [Pase
 
 All paseo/factory/burn-lab/connector runtime work targets the trial home `~/.paseo-factory` (never the default `~/.paseo` — that is prod, where only verified builds are installed). `paseo` sits at `~/.local/bin/paseo`; node comes from nvm (`~/.nvm/versions/node/`, default v24). On the Windows `Node`, the entire runtime runs inside **WSL2 (Ubuntu)** for 100% POSIX parity.
 
+Installing this plugin on a peer `Node`: `paseo plugin install '<git-url>:plugin' --ref <tag> --home ~/.paseo-factory` — the `:plugin` suffix is mandatory (the manifest lives in `plugin/`, not the repo root). Full runbook: `docs/install.md`.
+
 ## Agent skills
 
 ### Issue tracker
