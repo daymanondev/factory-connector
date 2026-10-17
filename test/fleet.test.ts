@@ -17,8 +17,28 @@ import {
   shouldPollNow,
   PULSE_INTERVAL_ACTIVE_MS,
   PULSE_INTERVAL_IDLE_MS,
+  pollFleetPulse,
+  loadFleetState,
+  fleetStatePath,
   type FleetState,
+  type FleetPulse,
+  type PulseTransport,
 } from "../src/fleet.ts";
+
+function makePulse(overrides: Partial<FleetPulse> & { nodeId: string }): FleetPulse {
+  return {
+    online: true,
+    cpuPercent: 10,
+    freeMemMb: 4096,
+    activeAgents: 0,
+    activeBurnRuns: 0,
+    meterSummary: null,
+    freePoolUpdatedAt: null,
+    runsUpdatedAt: null,
+    collectedAt: "2026-10-17T10:00:00.000Z",
+    ...overrides,
+  };
+}
 
 function makeTempHome(): string {
   const dir = mkdtempSync(join(tmpdir(), "factory-connector-fleet-"));
@@ -239,5 +259,134 @@ describe("adaptive pulse cadence", () => {
     // Active Fleet surface window (5s).
     assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 4_999 }), false);
     assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 5_000 }), true);
+  });
+});
+
+describe("Fleet pulse polling (pollFleetPulse → fleet-state.json)", () => {
+  function seededHome(): string {
+    const home = makeTempHome();
+    upsertNode(home, {
+      id: "mac-studio",
+      name: "Mac Studio",
+      posture: "stationary",
+      sshTarget: "ssh://andrew@100.101.102.103?daemonPort=6767",
+    });
+    upsertNode(home, {
+      id: "win-wsl",
+      name: "Windows WSL2",
+      posture: "stationary",
+      slotCeiling: 4,
+      healthGuard: { maxCpuPercent: 50, minFreeMemMb: 8192 },
+    });
+    return home;
+  }
+
+  const localSource = async () => ({
+    cpuPercent: 30,
+    freeMemMb: 6144,
+    activeAgents: 2,
+  });
+
+  it("polls local + peer Nodes through the transport and writes the merged snapshot", async () => {
+    const home = seededHome();
+    const config = loadFleetConfig(home);
+    const polled: string[] = [];
+    const transport: PulseTransport = {
+      fetchPulse: async (node) => {
+        polled.push(node.id);
+        return makePulse({ nodeId: node.id, cpuPercent: 20 });
+      },
+    };
+
+    const updatedAt = new Date("2026-10-17T10:00:00.000Z");
+    const state = await pollFleetPulse({
+      paseoHome: home,
+      transport,
+      localSource,
+      now: () => updatedAt,
+    });
+
+    assert.deepEqual(polled, ["mac-studio", "win-wsl"]);
+    assert.equal(state.localNodeId, config.localNodeId);
+    assert.equal(state.updatedAt, updatedAt.toISOString());
+    assert.equal(state.nodes.length, 3);
+
+    const local = state.nodes.find((node) => node.nodeId === config.localNodeId);
+    assert.ok(local);
+    assert.equal(local.online, true);
+    assert.equal(local.cpuPercent, 30);
+    assert.equal(local.activeAgents, 2);
+
+    const studio = state.nodes.find((node) => node.nodeId === "mac-studio");
+    assert.ok(studio);
+    assert.equal(studio.name, "Mac Studio");
+    assert.equal(studio.posture, "stationary");
+    assert.equal(studio.slotCeiling, DEFAULT_SLOT_CEILING);
+    assert.equal(studio.reserveMode, false);
+    assert.deepEqual(studio.healthGuard, DEFAULT_HEALTH_GUARD);
+    assert.equal(studio.slotsInUse, 0);
+
+    const wsl = state.nodes.find((node) => node.nodeId === "win-wsl");
+    assert.ok(wsl);
+    assert.equal(wsl.slotCeiling, 4);
+    assert.deepEqual(wsl.healthGuard, { maxCpuPercent: 50, minFreeMemMb: 8192 });
+
+    // The snapshot is on disk for the Connector bridge and deep-equals what
+    // loadFleetState reads back.
+    const onDisk = JSON.parse(readFileSync(fleetStatePath(home), "utf8"));
+    assert.deepEqual(onDisk, state);
+    assert.deepEqual(loadFleetState(home), state);
+  });
+
+  it("marks a peer offline with lastError when its transport fetch fails, without failing the poll", async () => {
+    const home = seededHome();
+    const transport: PulseTransport = {
+      fetchPulse: async (node) => {
+        if (node.id === "win-wsl") throw new Error("ssh: connect timeout");
+        return makePulse({ nodeId: node.id });
+      },
+    };
+
+    const state = await pollFleetPulse({ paseoHome: home, transport, localSource });
+
+    const wsl = state.nodes.find((node) => node.nodeId === "win-wsl");
+    assert.ok(wsl);
+    assert.equal(wsl.online, false);
+    assert.match(wsl.lastError ?? "", /ssh: connect timeout/);
+
+    const studio = state.nodes.find((node) => node.nodeId === "mac-studio");
+    assert.ok(studio);
+    assert.equal(studio.online, true);
+    assert.equal(studio.lastError, null);
+
+    // Snapshot still written with the offline node recorded.
+    assert.equal(existsSync(fleetStatePath(home)), true);
+  });
+
+  it("carries over slotsInUse from the previous snapshot so dispatch accounting survives repolls", async () => {
+    const home = seededHome();
+    const transport: PulseTransport = {
+      fetchPulse: async (node) => makePulse({ nodeId: node.id }),
+    };
+
+    const first = await pollFleetPulse({ paseoHome: home, transport, localSource });
+    const studio = first.nodes.find((node) => node.nodeId === "mac-studio");
+    assert.ok(studio);
+    studio.slotsInUse = 2; // as dispatch (ticket 03) would record in flight units
+
+    writeFileSync(fleetStatePath(home), JSON.stringify(first, null, 2), "utf8");
+
+    const second = await pollFleetPulse({ paseoHome: home, transport, localSource });
+    const studioAgain = second.nodes.find((node) => node.nodeId === "mac-studio");
+    assert.ok(studioAgain);
+    assert.equal(studioAgain.slotsInUse, 2);
+    const wslAgain = second.nodes.find((node) => node.nodeId === "win-wsl");
+    assert.ok(wslAgain);
+    assert.equal(wslAgain.slotsInUse, 0);
+  });
+
+  it("loadFleetState returns null when no snapshot exists yet", () => {
+    const home = makeTempHome();
+    assert.equal(loadFleetState(home), null);
   });
 });

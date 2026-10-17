@@ -365,3 +365,151 @@ export function shouldPollNow(
   if (Number.isNaN(updatedAt)) return true;
   return options.nowMs - updatedAt >= pulseIntervalMs(options.activeSurface);
 }
+
+/**
+ * Injectable seam for fetching a peer `Node`'s `Fleet pulse` digest.
+ * Production default is Tailscale SSH (`createSshPulseTransport`); tests pass a stub.
+ */
+export interface PulseTransport {
+  fetchPulse(node: FleetNode): Promise<FleetPulse>;
+}
+
+/** Default ceiling for a single peer pulse fetch before the `Node` is marked offline. */
+export const PULSE_FETCH_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function offlineNodeState(node: FleetNode, error: string): FleetNodeState {
+  const trimmed = error.length > 300 ? `${error.slice(0, 300)}…` : error;
+  return {
+    nodeId: node.id,
+    online: false,
+    cpuPercent: 0,
+    freeMemMb: 0,
+    activeAgents: 0,
+    activeBurnRuns: 0,
+    meterSummary: null,
+    freePoolUpdatedAt: null,
+    runsUpdatedAt: null,
+    collectedAt: new Date().toISOString(),
+    name: node.name,
+    posture: node.posture,
+    slotCeiling: node.slotCeiling,
+    reserveMode: node.reserveMode,
+    healthGuard: node.healthGuard,
+    slotsInUse: 0,
+    lastError: trimmed,
+  };
+}
+
+function mergeNodeState(node: FleetNode, pulse: FleetPulse, slotsInUse: number): FleetNodeState {
+  return {
+    nodeId: node.id,
+    online: pulse.online,
+    cpuPercent: pulse.cpuPercent,
+    freeMemMb: pulse.freeMemMb,
+    activeAgents: pulse.activeAgents,
+    activeBurnRuns: pulse.activeBurnRuns,
+    meterSummary: pulse.meterSummary ?? null,
+    freePoolUpdatedAt: pulse.freePoolUpdatedAt ?? null,
+    runsUpdatedAt: pulse.runsUpdatedAt ?? null,
+    collectedAt: pulse.collectedAt,
+    name: node.name,
+    posture: node.posture,
+    slotCeiling: node.slotCeiling,
+    reserveMode: node.reserveMode,
+    healthGuard: node.healthGuard,
+    slotsInUse,
+    lastError: null,
+  };
+}
+
+/**
+ * Reads the live `Fleet pulse` snapshot. Unlike the registry, a corrupted or
+ * missing snapshot is reported as `null` — it is a cache the next poll rewrites.
+ */
+export function loadFleetState(paseoHome: string): FleetState | null {
+  try {
+    return JSON.parse(readFileSync(fleetStatePath(paseoHome), "utf8")) as FleetState;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Collects the local `Fleet pulse`, fetches every peer `Node`'s digest through
+ * the injectable `PulseTransport` (a failing or timed-out peer is recorded as
+ * offline instead of failing the poll), and writes the merged snapshot to
+ * `<paseoHome>/connector/fleet-state.json` for the `Fleet surface` and the
+ * `Connector bridge`. `slotsInUse` values recorded by dispatch are carried
+ * over from the previous snapshot.
+ */
+export async function pollFleetPulse(options: {
+  paseoHome: string;
+  transport?: PulseTransport;
+  localSource?: LocalPulseSource;
+  fetchTimeoutMs?: number;
+  now?: () => Date;
+}): Promise<FleetState> {
+  const config = loadFleetConfig(options.paseoHome);
+  const transport = options.transport;
+  const timeoutMs = options.fetchTimeoutMs ?? PULSE_FETCH_TIMEOUT_MS;
+
+  const previousSlots = new Map(
+    (loadFleetState(options.paseoHome)?.nodes ?? []).map((node) => [node.nodeId, node.slotsInUse]),
+  );
+
+  const localPulse = await collectLocalPulse({
+    nodeId: config.localNodeId,
+    source: options.localSource,
+    now: options.now,
+  });
+
+  const nodes: FleetNodeState[] = await Promise.all(
+    config.nodes.map(async (node) => {
+      const slotsInUse = previousSlots.get(node.id) ?? 0;
+      if (node.id === config.localNodeId) {
+        return mergeNodeState(node, localPulse, slotsInUse);
+      }
+      if (!transport) {
+        return offlineNodeState(node, "no PulseTransport configured");
+      }
+      try {
+        const pulse = await withTimeout(
+          transport.fetchPulse(node),
+          timeoutMs,
+          `factory-connector: pulse fetch for ${node.id}`,
+        );
+        return mergeNodeState(node, pulse, slotsInUse);
+      } catch (error) {
+        return offlineNodeState(node, (error as Error).message);
+      }
+    }),
+  );
+
+  const state: FleetState = {
+    version: 1,
+    localNodeId: config.localNodeId,
+    updatedAt: (options.now ?? (() => new Date()))().toISOString(),
+    nodes,
+  };
+  writeJsonAtomic(fleetStatePath(options.paseoHome), state);
+  return state;
+}
