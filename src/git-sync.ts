@@ -268,3 +268,67 @@ export async function ensureMirrorRepoFromBundle(options: {
   const branch = (await runGit(runner, mirrorPath, ["rev-parse", "--abbrev-ref", "HEAD"])).trim();
   return { mirrorPath, created, headCommit, branch: branch === "HEAD" ? null : branch };
 }
+
+/** Asserts a `Fleet ref` path component is safe inside a git ref name. */
+function assertRefComponent(kind: string, value: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) || value.includes("..")) {
+    throw new Error(
+      `factory-connector: invalid ${kind} ${JSON.stringify(value)}; ref components must be ` +
+        "alphanumeric-led without spaces, path separators, or '..'",
+    );
+  }
+}
+
+/** The namespaced `Fleet ref` a peer `Node`'s completed work is staged under. */
+export function fleetRef(nodeId: string, runOrTaskId: string): string {
+  assertRefComponent("node id", nodeId);
+  assertRefComponent("run or task id", runOrTaskId);
+  return `refs/fleet/${nodeId}/${runOrTaskId}`;
+}
+
+/** The local branch a landed `Fleet ref` is materialized as. */
+export function fleetRefBranch(nodeId: string, runOrTaskId: string): string {
+  return fleetRef(nodeId, runOrTaskId).replace(/^refs\/fleet\//, "fleet/");
+}
+
+/** Result of staging a peer completion bundle into the local repository. */
+export interface StagedFleetRef {
+  /** The `refs/fleet/<nodeId>/<runOrTaskId>` ref that now holds the commits. */
+  ref: string;
+  /** Commit the ref points at (the bundle's HEAD). */
+  commit: string;
+}
+
+/**
+ * Unpacks a peer `Node`'s completed commit bundle into
+ * `refs/fleet/<nodeId>/<runOrTaskId>` in the local repository. The fetch
+ * writes objects and the ref only — the user's active working tree, index,
+ * `HEAD`, and checked-out branch are left untouched (verified by the tests);
+ * the operator applies the code later via `landFleetRef`. Re-staging the same
+ * ref (a peer follow-up) overwrites it with the newer completion.
+ */
+export async function stageFleetRefFromBundle(options: {
+  repoPath: string;
+  bundlePath: string;
+  nodeId: string;
+  runOrTaskId: string;
+  runner?: CommandRunner;
+}): Promise<StagedFleetRef> {
+  const runner = options.runner ?? execCommandRunner;
+  const ref = fleetRef(options.nodeId, options.runOrTaskId);
+  try {
+    await runGit(runner, options.repoPath, [
+      "fetch",
+      "--quiet",
+      options.bundlePath,
+      `+HEAD:${ref}`,
+    ]);
+  } catch (error) {
+    const stderr = (error as { stderr?: string }).stderr ?? (error as Error).message;
+    throw new Error(
+      `factory-connector: could not stage ${ref} from bundle ${options.bundlePath}: ${stderr}`,
+    );
+  }
+  const commit = (await runGit(runner, options.repoPath, ["rev-parse", ref])).trim();
+  return { ref, commit };
+}

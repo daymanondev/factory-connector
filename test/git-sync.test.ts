@@ -9,6 +9,9 @@ import {
   createCommitBundle,
   ensureMirrorRepoFromBundle,
   mirrorRepoPath,
+  fleetRef,
+  fleetRefBranch,
+  stageFleetRefFromBundle,
 } from "../src/git-sync.ts";
 
 const execFileAsync = promisify(execFile);
@@ -220,5 +223,131 @@ describe("ensureMirrorRepoFromBundle (<paseoHome>/connector/repos/<canonical-slu
       mirrorRepoPath(home, "demo-app"),
       join(home, "connector", "repos", "demo-app"),
     );
+  });
+});
+
+describe("stageFleetRefFromBundle (refs/fleet/<nodeId>/<runOrTaskId>)", () => {
+  /**
+   * The handoff round-trip in miniature: an initiator repo checked out at
+   * `base` with a dirty working tree and staged index, plus a peer's thin
+   * completion bundle carrying only the `base..HEAD` range the peer produced.
+   */
+  async function initiatorAwaitingPeerWork(): Promise<{
+    repo: string;
+    base: string;
+    peerHead: string;
+    bundlePath: string;
+  }> {
+    const { repo, base } = await makeInitiatorWithRange();
+    // Roll the initiator back to base and dirty it, as an active workspace would be.
+    await execFileAsync("git", ["-C", repo, "reset", "-q", "--hard", base]);
+    writeFileSync(join(repo, "notes.md"), "operator's uncommitted notes\n", "utf8");
+    writeFileSync(join(repo, "staged.txt"), "staged but uncommitted\n", "utf8");
+    await execFileAsync("git", ["-C", repo, "add", "staged.txt"]);
+
+    // The peer: starts from base, completes the run's commits.
+    const peerDir = join(makeTempDir("git-sync-peer"), "peer");
+    await execFileAsync("git", ["clone", "-q", repo, peerDir]);
+    await execFileAsync("git", ["-C", peerDir, "reset", "-q", "--hard", base]);
+    writeFileSync(join(peerDir, "file.txt"), "peer result\n", "utf8");
+    writeFileSync(join(peerDir, "result.md"), "# peer report\n", "utf8");
+    const peerHead = await commitAll(peerDir, "peer completed the run");
+
+    // A thin base..HEAD completion bundle — exactly what a peer sends back.
+    const bundlePath = join(makeTempDir("git-sync-peer-bundle"), "attempt.bundle");
+    await execFileAsync("git", [
+      "-C",
+      peerDir,
+      "bundle",
+      "create",
+      bundlePath,
+      `${base}..HEAD`,
+    ]);
+    return { repo, base, peerHead, bundlePath };
+  }
+
+  it("stages the peer's completed commits under refs/fleet/<nodeId>/<runId> with the working tree and index untouched", async () => {
+    const ctx = await initiatorAwaitingPeerWork();
+    const statusBefore = (await git(ctx.repo, "status", "--porcelain")).trim();
+    const headBefore = (await git(ctx.repo, "rev-parse", "HEAD")).trim();
+    const branchBefore = (await git(ctx.repo, "rev-parse", "--abbrev-ref", "HEAD")).trim();
+
+    const staged = await stageFleetRefFromBundle({
+      repoPath: ctx.repo,
+      bundlePath: ctx.bundlePath,
+      nodeId: "mac-studio",
+      runOrTaskId: "run-42",
+    });
+
+    assert.equal(staged.ref, "refs/fleet/mac-studio/run-42");
+    assert.equal(staged.commit, ctx.peerHead);
+    assert.equal((await git(ctx.repo, "rev-parse", "refs/fleet/mac-studio/run-42")).trim(), ctx.peerHead);
+
+    // The operator's active workspace is exactly as it was.
+    assert.equal((await git(ctx.repo, "status", "--porcelain")).trim(), statusBefore);
+    assert.equal((await git(ctx.repo, "rev-parse", "HEAD")).trim(), headBefore);
+    assert.equal((await git(ctx.repo, "rev-parse", "--abbrev-ref", "HEAD")).trim(), branchBefore);
+    assert.equal(readFileSync(join(ctx.repo, "notes.md"), "utf8"), "operator's uncommitted notes\n");
+    assert.equal(readFileSync(join(ctx.repo, "staged.txt"), "utf8"), "staged but uncommitted\n");
+    // The staged commits' content is reachable without any checkout.
+    assert.equal((await git(ctx.repo, "show", `${ctx.peerHead}:file.txt`)).trim(), "peer result");
+  });
+
+  it("re-staging the same ref overwrites it with the peer's newer completion", async () => {
+    const ctx = await initiatorAwaitingPeerWork();
+    await stageFleetRefFromBundle({
+      repoPath: ctx.repo,
+      bundlePath: ctx.bundlePath,
+      nodeId: "mac-studio",
+      runOrTaskId: "run-42",
+    });
+
+    // The peer produces a follow-up commit and re-bundles.
+    const peerDir = join(makeTempDir("git-sync-peer2"), "peer");
+    await execFileAsync("git", ["clone", "-q", ctx.repo, peerDir]);
+    await execFileAsync("git", ["-C", peerDir, "fetch", "-q", ctx.bundlePath, "HEAD"]);
+    await execFileAsync("git", ["-C", peerDir, "reset", "-q", "--hard", "FETCH_HEAD"]);
+    writeFileSync(join(peerDir, "file.txt"), "peer result v2\n", "utf8");
+    const newerHead = await commitAll(peerDir, "peer follow-up");
+    const bundle2 = join(makeTempDir("git-sync-peer-bundle2"), "attempt2.bundle");
+    await execFileAsync("git", ["-C", peerDir, "bundle", "create", bundle2, `${ctx.base}..HEAD`]);
+
+    const restaged = await stageFleetRefFromBundle({
+      repoPath: ctx.repo,
+      bundlePath: bundle2,
+      nodeId: "mac-studio",
+      runOrTaskId: "run-42",
+    });
+    assert.equal(restaged.commit, newerHead);
+    assert.equal(
+      (await git(ctx.repo, "rev-parse", "refs/fleet/mac-studio/run-42")).trim(),
+      newerHead,
+    );
+  });
+
+  it("rejects node ids and run ids that are not usable inside a git ref", async () => {
+    const ctx = await initiatorAwaitingPeerWork();
+    for (const bad of [
+      { nodeId: "has space", runOrTaskId: "run-42" },
+      { nodeId: "mac-studio", runOrTaskId: "a..b" },
+      { nodeId: ".leads-with-dot", runOrTaskId: "run-42" },
+      { nodeId: "mac-studio", runOrTaskId: "" },
+    ]) {
+      await assert.rejects(
+        () =>
+          stageFleetRefFromBundle({
+            repoPath: ctx.repo,
+            bundlePath: ctx.bundlePath,
+            nodeId: bad.nodeId,
+            runOrTaskId: bad.runOrTaskId,
+          }),
+        /ref/,
+      );
+    }
+  });
+
+  it("fleetRef/fleetRefBuild helpers spell the ref and branch namespaces", () => {
+    assert.equal(fleetRef("mac-studio", "run-42"), "refs/fleet/mac-studio/run-42");
+    assert.equal(fleetRefBranch("mac-studio", "run-42"), "fleet/mac-studio/run-42");
   });
 });
