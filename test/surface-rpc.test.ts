@@ -539,3 +539,66 @@ describe("connector.handoff", () => {
     assert.match(reply.error, /no eligible stationary Node/);
   });
 });
+
+describe("connector.burst", () => {
+  it("distributes work units across eligible Nodes through the injected runners and releases slots", async () => {
+    const home = makeTempHome("burst");
+    seedRegistry(home, [fleetNode({ id: "studio-a" })]);
+    await primeState(home, stubTransport({ "studio-a": {} }).transport);
+    const localRuns: Array<{ command: string; args: string[] }> = [];
+    const remoteRuns: Array<{ nodeId: string; command: string }> = [];
+    const handlers = makeHandlers(home, {
+      localRunner: {
+        async run(command, args) {
+          localRuns.push({ command, args });
+          return { stdout: `local:${args.join(" ")}`, stderr: "" };
+        },
+      },
+      remoteRunner: {
+        async run(node, command) {
+          remoteRuns.push({ nodeId: node.id, command });
+          return { stdout: `remote:${node.id}`, stderr: "" };
+        },
+      },
+    });
+
+    const reply = await handlers.burst({
+      units: [
+        { id: "probe-1", command: "echo one" },
+        { id: "probe-2", command: "echo two" },
+      ],
+    });
+
+    assert.equal(reply.ok, true, reply.ok ? "" : reply.error);
+    if (!reply.ok) return;
+    assert.equal(reply.report.ok, true);
+    assert.equal(reply.report.results.length, 2);
+    for (const result of reply.report.results) {
+      assert.equal(result.ok, true);
+      assert.equal(result.attempts.length, 1, "a healthy unit runs exactly once");
+      assert.ok(result.nodeId);
+    }
+    assert.equal(localRuns.length + remoteRuns.length, 2, "every unit ran on exactly one Node");
+    // In-flight slot accounting settled back to zero on every Node.
+    const state = JSON.parse(
+      readFileSync(join(home, "connector", "fleet-state.json"), "utf8"),
+    ) as FleetState;
+    assert.ok(state.nodes.every((node) => node.slotsInUse === 0));
+  });
+
+  it("refuses as data when no Node is eligible", async () => {
+    const home = makeTempHome("burst-none");
+    seedRegistry(home, [fleetNode({ id: "studio-a", reserveMode: true })]);
+    // No pulse: the local Node is the only entry and it defaults eligible, so
+    // reserve it too — the Fleet then has nowhere to schedule.
+    const handlers = makeHandlers(home, {});
+    await handlers.nodeReserve({ nodeId: "laptop", reserveMode: true });
+
+    const reply = await handlers.burst({ units: [{ id: "probe-1", command: "echo one" }] });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "burst-failed");
+    assert.match(reply.error, /no eligible online Node/);
+  });
+});

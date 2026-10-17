@@ -24,10 +24,16 @@ import {
   type PulseTransport,
 } from "./core/fleet.ts";
 import type { GossipArtifactTransport } from "./core/git-sync.ts";
-import { dispatchHandoff, type GitBundleTransport, type HandoffRecord, type RemoteCommandRunner } from "./core/dispatch.ts";
+import {
+  dispatchHandoff,
+  executeBurst,
+  type GitBundleTransport,
+  type HandoffRecord,
+  type RemoteCommandRunner,
+} from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
-import type { FleetNodeInputView, FleetView, HandoffRecordView } from "../shared/view.ts";
+import { burst, handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
+import type { BurstReportView, FleetNodeInputView, FleetView, HandoffRecordView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
 export interface SurfaceCallContext {
@@ -214,6 +220,24 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         return failure("handoff-failed", messageOf(error));
       }
     },
+
+    async burst(input: { units: { id: string; command: string }[] }) {
+      try {
+        const report = await executeBurst({
+          paseoHome: deps.paseoHome,
+          state: await currentState(),
+          units: input.units,
+          localRunner: deps.localRunner,
+          remoteRunner: deps.remoteRunner,
+          now: deps.now,
+        });
+        const settled = report.results.filter((result) => result.ok).length;
+        log(`burst: ${settled}/${report.results.length} units settled ok`);
+        return { ok: true as const, report: report as BurstReportView };
+      } catch (error) {
+        return failure("burst-failed", messageOf(error));
+      }
+    },
   };
 }
 
@@ -231,4 +255,5 @@ export function registerSurfaceRpc(server: PluginServerContext, handlers: Surfac
   server.handle(nodeReserve, (input) => handlers.nodeReserve(input));
   server.handle(pulse, (input) => handlers.pulse(input));
   server.handle(handoff, (input) => handlers.handoff(input));
+  server.handle(burst, (input) => handlers.burst(input));
 }

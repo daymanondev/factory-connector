@@ -102,3 +102,35 @@ export const FleetViewSchema = z.object({
   handoffs: z.array(HandoffRecordViewSchema),
 });
 export type FleetView = z.infer<typeof FleetViewSchema>;
+
+/** One execution of one `Burst` work unit on one `Node` (failover appends more). */
+export const BurstAttemptViewSchema = z.object({
+  nodeId: z.string(),
+  startedAt: z.string(),
+  endedAt: z.string(),
+  ok: z.boolean(),
+  error: z.string().nullable(),
+  stdout: z.string(),
+  stderr: z.string(),
+});
+export type BurstAttemptView = z.infer<typeof BurstAttemptViewSchema>;
+
+/** Final outcome of one `Burst` work unit: every attempt in order plus where it settled. */
+export const BurstUnitResultViewSchema = z.object({
+  unitId: z.string(),
+  command: z.string(),
+  attempts: z.array(BurstAttemptViewSchema),
+  ok: z.boolean(),
+  /** `Node` that finally ran the unit (null when every attempt failed). */
+  nodeId: z.string().nullable(),
+});
+export type BurstUnitResultView = z.infer<typeof BurstUnitResultViewSchema>;
+
+/** What a whole `Burst` settled to. */
+export const BurstReportViewSchema = z.object({
+  ok: z.boolean(),
+  startedAt: z.string(),
+  finishedAt: z.string(),
+  results: z.array(BurstUnitResultViewSchema),
+});
+export type BurstReportView = z.infer<typeof BurstReportViewSchema>;

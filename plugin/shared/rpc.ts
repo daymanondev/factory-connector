@@ -8,7 +8,7 @@
  */
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FleetNodeInputSchema, FleetViewSchema, HandoffKindSchema, HandoffRecordViewSchema } from "./view.ts";
+import { BurstReportViewSchema, FleetNodeInputSchema, FleetViewSchema, HandoffKindSchema, HandoffRecordViewSchema } from "./view.ts";
 
 /** Every handler's refusal shape: a stable machine code plus the human sentence. */
 export const Failure = z.object({ ok: z.literal(false), code: z.string(), error: z.string() });
@@ -65,4 +65,19 @@ export const handoff = defineRpc({
     targetNodeId: z.string().optional(),
   }),
   output: z.union([z.object({ ok: z.literal(true), handoff: HandoffRecordViewSchema }), Failure]),
+});
+
+export const burst = defineRpc({
+  name: "connector.burst",
+  input: z.object({
+    units: z
+      .array(
+        z.object({
+          id: z.string().min(1),
+          command: z.string().min(1),
+        }),
+      )
+      .min(1),
+  }),
+  output: z.union([z.object({ ok: z.literal(true), report: BurstReportViewSchema }), Failure]),
 });
