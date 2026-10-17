@@ -539,4 +539,63 @@ describe("dispatchHandoff (initiating Node side)", () => {
     assert.equal(failed.status, "failed");
     assert.match(failed.error ?? "", /connection reset/);
   });
+
+  it("survives initiator disconnect: the target completes autonomously and the recorded Fleet ref reconciles on reconnect", async () => {
+    const { repo, base, head } = await makeProjectWithInclude();
+    const { initiatorHome, state } = seededFleet();
+    const targetHome = makeTempHome("dispatch-target");
+    const { spawn } = recordingSpawn();
+    const { transport, remoteRunner } = simulatedTargetNode(targetHome, spawn);
+
+    const record = await dispatchHandoff({
+      paseoHome: initiatorHome,
+      projectPath: repo,
+      base,
+      canonicalSlug: "my-proj",
+      brief,
+      state,
+      handoffId: "ho-live",
+      bundleTransport: transport,
+      remoteRunner,
+      now: () => dispatchedAt,
+    });
+
+    // The initiator disconnects: its staging artifacts are gone. The target's
+    // mirror, inbound record, and detached run live entirely under its own home.
+    rmSync(join(initiatorHome, "connector", "handoffs", "ho-live"), { recursive: true, force: true });
+    const mirrorPath = join(targetHome, "connector", "repos", "my-proj");
+    assert.equal((await git(mirrorPath, "rev-parse", "HEAD")).trim(), head);
+    assert.ok(loadHandoff(targetHome, "ho-live"));
+
+    // The target runs the job to completion: a new commit lands on its mirror.
+    writeFileSync(join(mirrorPath, "playbook.txt"), "done\n", "utf8");
+    const completedHead = await commitAll(mirrorPath, "handoff completion");
+    assert.notEqual(completedHead, head);
+
+    // The initiator reconnects: the outbound record it kept names the exact
+    // `Fleet ref` the completion stages under — no shared state required.
+    const reconciled = loadHandoff(initiatorHome, "ho-live");
+    assert.ok(reconciled);
+    assert.equal(reconciled.expectedFleetRef, "refs/fleet/studio-a/run-42");
+
+    const completionBundle = join(makeTempDir("dispatch-completion"), "done.bundle");
+    await createCommitBundle({ repoPath: mirrorPath, base: head, outPath: completionBundle });
+    const staged = await stageFleetRefFromBundle({
+      repoPath: repo,
+      bundlePath: completionBundle,
+      nodeId: reconciled.targetNodeId,
+      runOrTaskId: reconciled.runOrTaskId,
+    });
+    assert.equal(staged.ref, reconciled.expectedFleetRef);
+
+    const landed = await landFleetRef({
+      repoPath: repo,
+      nodeId: reconciled.targetNodeId,
+      runOrTaskId: reconciled.runOrTaskId,
+      mode: "checkout",
+    });
+    assert.equal(landed.branch, "fleet/studio-a/run-42");
+    assert.equal((await git(repo, "rev-parse", "HEAD")).trim(), completedHead);
+    assert.equal(readFileSync(join(repo, "playbook.txt"), "utf8"), "done\n");
+  });
 });
