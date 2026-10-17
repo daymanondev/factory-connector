@@ -175,3 +175,102 @@ describe("connector.snapshot", () => {
     assert.equal(studio.lastError, null);
   });
 });
+
+describe("connector.node.upsert", () => {
+  it("registers a new Node with defaults and returns the refreshed view", async () => {
+    const home = makeTempHome("upsert");
+    seedRegistry(home, []);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.nodeUpsert({
+      id: "wsl-box",
+      name: "WSL Box",
+      posture: "stationary",
+      sshTarget: "ssh://andrew@100.101.102.200?daemonPort=6767",
+    });
+
+    assert.equal(reply.ok, true);
+    if (!reply.ok) return;
+    const registered = reply.view.nodes.find((node) => node.id === "wsl-box");
+    assert.ok(registered);
+    assert.equal(registered.posture, "stationary");
+    assert.equal(registered.transport, "ssh");
+    assert.equal(registered.sshTarget, "ssh://andrew@100.101.102.200?daemonPort=6767");
+    assert.equal(registered.slotCeiling, 2, "unspecified slotCeiling falls back to the default");
+    assert.equal(registered.reserveMode, false);
+    assert.deepEqual(registered.healthGuard, { maxCpuPercent: 85, minFreeMemMb: 2048 });
+    // The registration persisted — a fresh fold sees it too.
+    const again = await handlers.snapshot({});
+    assert.ok(again.ok && again.view.nodes.some((node) => node.id === "wsl-box"));
+  });
+
+  it("updates an existing Node, keeping the full editor payload authoritative", async () => {
+    const home = makeTempHome("upsert-update");
+    seedRegistry(home, [fleetNode({ id: "studio-a", slotCeiling: 4 })]);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.nodeUpsert({
+      id: "studio-a",
+      name: "Studio A",
+      posture: "stationary",
+      slotCeiling: 6,
+      reserveMode: true,
+      healthGuard: { maxCpuPercent: 70, minFreeMemMb: 4096 },
+    });
+
+    assert.equal(reply.ok, true);
+    if (!reply.ok) return;
+    const updated = reply.view.nodes.find((node) => node.id === "studio-a");
+    assert.ok(updated);
+    assert.equal(updated.slotCeiling, 6);
+    assert.equal(updated.reserveMode, true);
+    assert.deepEqual(updated.healthGuard, { maxCpuPercent: 70, minFreeMemMb: 4096 });
+  });
+
+  it("refuses an invalid posture as data, never a thrown exception", async () => {
+    const home = makeTempHome("upsert-invalid");
+    seedRegistry(home, []);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.nodeUpsert({
+      id: "bad",
+      name: "Bad",
+      // @ts-expect-error — the wire contract must refuse what the schema forbids.
+      posture: "laptopish",
+    });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "invalid-node");
+    assert.match(reply.error, /posture/);
+  });
+});
+
+describe("connector.node.reserve", () => {
+  it("toggles Reserve mode on a Node and reports it in the view", async () => {
+    const home = makeTempHome("reserve");
+    seedRegistry(home, [fleetNode({ id: "studio-a" })]);
+    const handlers = makeHandlers(home);
+
+    const off = await handlers.nodeReserve({ nodeId: "studio-a", reserveMode: true });
+    assert.equal(off.ok, true);
+    assert.ok(off.ok && off.view.nodes.find((node) => node.id === "studio-a")?.reserveMode === true);
+
+    const on = await handlers.nodeReserve({ nodeId: "studio-a", reserveMode: false });
+    assert.equal(on.ok, true);
+    assert.ok(on.ok && on.view.nodes.find((node) => node.id === "studio-a")?.reserveMode === false);
+  });
+
+  it("refuses to toggle a Node the Fleet does not know", async () => {
+    const home = makeTempHome("reserve-unknown");
+    seedRegistry(home, []);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.nodeReserve({ nodeId: "ghost", reserveMode: true });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "unknown-node");
+    assert.match(reply.error, /ghost/);
+  });
+});

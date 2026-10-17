@@ -9,12 +9,12 @@
  * temp paseo home, production defaults to Tailscale SSH in BatchMode.
  */
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import type { CommandRunner, LocalPulseSource, PulseTransport } from "./core/fleet.ts";
+import { setNodeReserveMode, upsertNode, type CommandRunner, type LocalPulseSource, type PulseTransport } from "./core/fleet.ts";
 import type { GossipArtifactTransport } from "./core/git-sync.ts";
 import type { GitBundleTransport, RemoteCommandRunner } from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { snapshot } from "../shared/rpc.ts";
-import type { FleetView } from "../shared/view.ts";
+import { nodeReserve, nodeUpsert, snapshot } from "../shared/rpc.ts";
+import type { FleetNodeInputView, FleetView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
 export interface SurfaceCallContext {
@@ -69,6 +69,26 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         return failure("snapshot-failed", messageOf(error));
       }
     },
+
+    async nodeUpsert(input: FleetNodeInputView) {
+      try {
+        upsertNode(deps.paseoHome, input);
+        log(`node.upsert: ${input.id} (${input.posture}) registered`);
+        return { ok: true as const, view: view() };
+      } catch (error) {
+        return failure("invalid-node", messageOf(error));
+      }
+    },
+
+    async nodeReserve(input: { nodeId: string; reserveMode: boolean }) {
+      try {
+        setNodeReserveMode(deps.paseoHome, input.nodeId, input.reserveMode);
+        log(`node.reserve: ${input.nodeId} → ${input.reserveMode ? "reserved" : "available"}`);
+        return { ok: true as const, view: view() };
+      } catch (error) {
+        return failure("unknown-node", messageOf(error));
+      }
+    },
   };
 }
 
@@ -81,4 +101,6 @@ export type SurfaceHandlers = ReturnType<typeof createSurfaceHandlers>;
  */
 export function registerSurfaceRpc(server: PluginServerContext, handlers: SurfaceHandlers): void {
   server.handle(snapshot, (input) => handlers.snapshot(input));
+  server.handle(nodeUpsert, (input) => handlers.nodeUpsert(input));
+  server.handle(nodeReserve, (input) => handlers.nodeReserve(input));
 }
