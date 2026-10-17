@@ -11,7 +11,7 @@
  */
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { hostname } from "node:os";
+import * as os from "node:os";
 import { dirname, join } from "node:path";
 
 /** Physical availability classification of a `Node`. */
@@ -57,6 +57,48 @@ export interface FleetConfig {
   nodes: FleetNode[];
 }
 
+/** Compact per-`Meter` totals carried inside a `Fleet pulse` digest. */
+export type MeterSummary = Record<string, number>;
+
+/**
+ * The sub-kilobyte `Fleet pulse` digest exchanged between `Node`s
+ * (ADR 0001 §3: digest-first transport, never token/log streaming).
+ */
+export interface FleetPulse {
+  nodeId: string;
+  online: boolean;
+  cpuPercent: number;
+  freeMemMb: number;
+  activeAgents: number;
+  activeBurnRuns: number;
+  meterSummary: MeterSummary | null;
+  freePoolUpdatedAt: string | null;
+  runsUpdatedAt: string | null;
+  /** ISO timestamp of when this digest was collected on its `Node`. */
+  collectedAt: string;
+}
+
+/** A `Fleet pulse` merged with the `Node`'s registry facts — one row of `fleet-state.json`. */
+export interface FleetNodeState extends FleetPulse {
+  name: string;
+  posture: NodePosture;
+  slotCeiling: number;
+  reserveMode: boolean;
+  healthGuard: HealthGuard;
+  /** Delegated work units currently assigned to the `Node` (maintained by dispatch). */
+  slotsInUse: number;
+  /** Why the last pulse fetch failed for an offline `Node`, if it did. */
+  lastError: string | null;
+}
+
+/** Contents of `<paseoHome>/connector/fleet-state.json` (the `Connector bridge` input). */
+export interface FleetState {
+  version: 1;
+  localNodeId: string;
+  updatedAt: string;
+  nodes: FleetNodeState[];
+}
+
 export const FLEET_CONFIG_FILENAME = "fleet.json";
 export const FLEET_STATE_FILENAME = "fleet-state.json";
 
@@ -98,7 +140,7 @@ function slugifyHostName(host: string): string {
  * one that may disconnect, which is the conservative scheduling default.
  */
 export function defaultLocalNode(): FleetNode {
-  const host = hostname();
+  const host = os.hostname();
   return {
     id: slugifyHostName(host),
     name: host,
@@ -218,4 +260,108 @@ export function setNodeReserveMode(
   node.reserveMode = reserveMode;
   saveFleetConfig(paseoHome, config);
   return config;
+}
+
+/** Local machine facts a `Fleet pulse` is built from, minus transport bookkeeping. */
+export interface LocalPulseSample {
+  cpuPercent: number;
+  freeMemMb: number;
+  activeAgents?: number;
+  activeBurnRuns?: number;
+  meterSummary?: MeterSummary | null;
+  freePoolUpdatedAt?: string | null;
+  runsUpdatedAt?: string | null;
+}
+
+/** Injectable source of the local `Node`'s pulse facts (tests pass a stub). */
+export type LocalPulseSource = () => Promise<LocalPulseSample>;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sampleCpuPercent(sampleDelayMs = 120): Promise<number> {
+  const total = (snapshot: ReturnType<typeof os.cpus>) =>
+    snapshot.reduce(
+      (acc, cpu) => {
+        const idle = cpu.times.idle;
+        const all = cpu.times.idle + cpu.times.user + cpu.times.nice + cpu.times.sys + cpu.times.irq;
+        return { idle: acc.idle + idle, all: acc.all + all };
+      },
+      { idle: 0, all: 0 },
+    );
+  const start = total(os.cpus());
+  await sleep(sampleDelayMs);
+  const end = total(os.cpus());
+  const allDelta = end.all - start.all;
+  if (allDelta <= 0) return 0;
+  const busyDelta = allDelta - (end.idle - start.idle);
+  return Math.min(100, Math.max(0, Math.round((busyDelta / allDelta) * 1000) / 10));
+}
+
+/**
+ * Production `LocalPulseSource`: real CPU% from two `os.cpus()` samples and
+ * free memory from `os.freemem()`. Paseo `Agent`/`Burn run` activity counts are
+ * zero until the plugin server layer (which can query the daemon) supplies them.
+ */
+export function defaultLocalPulseSource(): LocalPulseSource {
+  return async () => {
+    const [cpuPercent, freeMemBytes] = [await sampleCpuPercent(), os.freemem()];
+    return {
+      cpuPercent,
+      freeMemMb: Math.round(freeMemBytes / (1024 * 1024)),
+      activeAgents: 0,
+      activeBurnRuns: 0,
+      meterSummary: null,
+      freePoolUpdatedAt: null,
+      runsUpdatedAt: null,
+    };
+  };
+}
+
+/** Assembles the local `Node`'s sub-kilobyte `Fleet pulse` digest. */
+export async function collectLocalPulse(input: {
+  nodeId: string;
+  source?: LocalPulseSource;
+  now?: () => Date;
+}): Promise<FleetPulse> {
+  const source = input.source ?? defaultLocalPulseSource();
+  const sample = await source();
+  return {
+    nodeId: input.nodeId,
+    online: true,
+    cpuPercent: sample.cpuPercent,
+    freeMemMb: sample.freeMemMb,
+    activeAgents: sample.activeAgents ?? 0,
+    activeBurnRuns: sample.activeBurnRuns ?? 0,
+    meterSummary: sample.meterSummary ?? null,
+    freePoolUpdatedAt: sample.freePoolUpdatedAt ?? null,
+    runsUpdatedAt: sample.runsUpdatedAt ?? null,
+    collectedAt: (input.now ?? (() => new Date()))().toISOString(),
+  };
+}
+
+/** Background `Fleet pulse` cadence (idle, `Fleet surface` closed). */
+export const PULSE_INTERVAL_IDLE_MS = 60_000;
+
+/** Active `Fleet pulse` cadence while the `Fleet surface` is open (5–10s window, ADR 0001 §3). */
+export const PULSE_INTERVAL_ACTIVE_MS = 5_000;
+
+/** The effective pulse interval for the given surface visibility. */
+export function pulseIntervalMs(activeSurface: boolean): number {
+  return activeSurface ? PULSE_INTERVAL_ACTIVE_MS : PULSE_INTERVAL_IDLE_MS;
+}
+
+/**
+ * Adaptive-cadence gate: true when a poll is due given the previous snapshot's
+ * `updatedAt` and whether the `Fleet surface` is currently open.
+ */
+export function shouldPollNow(
+  previous: FleetState | null,
+  options: { activeSurface: boolean; nowMs: number },
+): boolean {
+  if (!previous) return true;
+  const updatedAt = Date.parse(previous.updatedAt);
+  if (Number.isNaN(updatedAt)) return true;
+  return options.nowMs - updatedAt >= pulseIntervalMs(options.activeSurface);
 }

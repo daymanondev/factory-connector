@@ -11,6 +11,13 @@ import {
   fleetConfigPath,
   upsertNode,
   setNodeReserveMode,
+  collectLocalPulse,
+  defaultLocalPulseSource,
+  pulseIntervalMs,
+  shouldPollNow,
+  PULSE_INTERVAL_ACTIVE_MS,
+  PULSE_INTERVAL_IDLE_MS,
+  type FleetState,
 } from "../src/fleet.ts";
 
 function makeTempHome(): string {
@@ -156,5 +163,81 @@ describe("Reserve mode (setNodeReserveMode)", () => {
   it("throws for an unknown Node id", () => {
     const home = makeTempHome();
     assert.throws(() => setNodeReserveMode(home, "ghost", true), /ghost/);
+  });
+});
+
+describe("Fleet pulse digest (collectLocalPulse)", () => {
+  it("collects a sub-kilobyte pulse digest from an injected source with a deterministic clock", async () => {
+    const collectedAt = new Date("2026-10-17T10:00:00.000Z");
+    const pulse = await collectLocalPulse({
+      nodeId: "mac",
+      now: () => collectedAt,
+      source: async () => ({
+        cpuPercent: 23.5,
+        freeMemMb: 8192,
+        activeAgents: 3,
+        activeBurnRuns: 1,
+        meterSummary: { totalTokens: 120000, totalUsd: 1.25 },
+        freePoolUpdatedAt: "2026-10-17T09:59:00.000Z",
+        runsUpdatedAt: "2026-10-17T09:58:00.000Z",
+      }),
+    });
+
+    assert.deepEqual(pulse, {
+      nodeId: "mac",
+      online: true,
+      cpuPercent: 23.5,
+      freeMemMb: 8192,
+      activeAgents: 3,
+      activeBurnRuns: 1,
+      meterSummary: { totalTokens: 120000, totalUsd: 1.25 },
+      freePoolUpdatedAt: "2026-10-17T09:59:00.000Z",
+      runsUpdatedAt: "2026-10-17T09:58:00.000Z",
+      collectedAt: "2026-10-17T10:00:00.000Z",
+    });
+
+    // The whole digest must stay sub-kilobyte on the wire (ADR 0001 §3).
+    const digestBytes = Buffer.byteLength(JSON.stringify(pulse), "utf8");
+    assert.ok(digestBytes < 1024, `digest was ${digestBytes} bytes`);
+  });
+
+  it("collects real local metrics with the default source (cpu in range, mem positive)", async () => {
+    const pulse = await collectLocalPulse({ nodeId: "mac", source: defaultLocalPulseSource() });
+    assert.equal(pulse.online, true);
+    assert.ok(pulse.cpuPercent >= 0 && pulse.cpuPercent <= 100, `cpu ${pulse.cpuPercent}`);
+    assert.ok(pulse.freeMemMb > 0, `freeMemMb ${pulse.freeMemMb}`);
+    assert.equal(pulse.activeAgents, 0);
+    assert.equal(pulse.activeBurnRuns, 0);
+    assert.equal(pulse.meterSummary, null);
+    assert.ok(!Number.isNaN(Date.parse(pulse.collectedAt)));
+  });
+});
+
+describe("adaptive pulse cadence", () => {
+  it("uses 60s background and 5s active-surface intervals", () => {
+    assert.equal(PULSE_INTERVAL_IDLE_MS, 60_000);
+    assert.equal(PULSE_INTERVAL_ACTIVE_MS, 5_000);
+    assert.equal(pulseIntervalMs(false), 60_000);
+    assert.equal(pulseIntervalMs(true), 5_000);
+  });
+
+  it("polls immediately without prior state, then respects the idle/active windows", () => {
+    const t0 = Date.parse("2026-10-17T10:00:00.000Z");
+    assert.equal(shouldPollNow(null, { activeSurface: false, nowMs: t0 }), true);
+
+    const state = {
+      version: 1,
+      localNodeId: "mac",
+      updatedAt: new Date(t0).toISOString(),
+      nodes: [],
+    } as FleetState;
+
+    // Idle window (60s): too soon until the full minute elapses.
+    assert.equal(shouldPollNow(state, { activeSurface: false, nowMs: t0 + 59_999 }), false);
+    assert.equal(shouldPollNow(state, { activeSurface: false, nowMs: t0 + 60_000 }), true);
+
+    // Active Fleet surface window (5s).
+    assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 4_999 }), false);
+    assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 5_000 }), true);
   });
 });
