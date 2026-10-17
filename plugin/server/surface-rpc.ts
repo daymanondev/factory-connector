@@ -9,11 +9,23 @@
  * temp paseo home, production defaults to Tailscale SSH in BatchMode.
  */
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { loadFleetConfig, removeNode, setNodeReserveMode, upsertNode, type CommandRunner, type LocalPulseSource, type PulseTransport } from "./core/fleet.ts";
+import {
+  defaultLocalPulseSource,
+  loadFleetConfig,
+  loadFleetState,
+  pollFleetPulse,
+  removeNode,
+  setNodeReserveMode,
+  shouldPollNow,
+  upsertNode,
+  type CommandRunner,
+  type LocalPulseSource,
+  type PulseTransport,
+} from "./core/fleet.ts";
 import type { GossipArtifactTransport } from "./core/git-sync.ts";
 import type { GitBundleTransport, RemoteCommandRunner } from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { nodeRemove, nodeReserve, nodeUpsert, snapshot } from "../shared/rpc.ts";
+import { nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
 import type { FleetNodeInputView, FleetView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
@@ -67,6 +79,28 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         return { ok: true as const, view: view() };
       } catch (error) {
         return failure("snapshot-failed", messageOf(error));
+      }
+    },
+
+    async pulse(input: { activeSurface?: boolean }) {
+      try {
+        const now = deps.now ?? (() => new Date());
+        const previous = loadFleetState(deps.paseoHome);
+        const due = shouldPollNow(previous, {
+          activeSurface: input.activeSurface === true,
+          nowMs: now().getTime(),
+        });
+        const state = due
+          ? await pollFleetPulse({
+              paseoHome: deps.paseoHome,
+              transport: deps.transport,
+              localSource: deps.localSource ?? defaultLocalPulseSource(),
+              now,
+            })
+          : (previous as NonNullable<typeof previous>);
+        return { ok: true as const, view: view(state) };
+      } catch (error) {
+        return failure("pulse-failed", messageOf(error));
       }
     },
 
@@ -125,4 +159,5 @@ export function registerSurfaceRpc(server: PluginServerContext, handlers: Surfac
   server.handle(nodeUpsert, (input) => handlers.nodeUpsert(input));
   server.handle(nodeRemove, (input) => handlers.nodeRemove(input));
   server.handle(nodeReserve, (input) => handlers.nodeReserve(input));
+  server.handle(pulse, (input) => handlers.pulse(input));
 }

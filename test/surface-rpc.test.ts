@@ -5,7 +5,7 @@
  */
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -319,5 +319,56 @@ describe("connector.node.remove", () => {
     assert.equal(reply.ok, false);
     if (reply.ok) return;
     assert.equal(reply.code, "unknown-node");
+  });
+});
+
+describe("connector.pulse", () => {
+  it("polls every Node on the first call and reports unreachable peers offline with the reason", async () => {
+    const home = makeTempHome("pulse-first");
+    seedRegistry(home, [fleetNode({ id: "studio-a" }), fleetNode({ id: "studio-b" })]);
+    const { calls, transport } = stubTransport({ "studio-a": { cpuPercent: 30, freeMemMb: 2048 } });
+    const handlers = makeHandlers(home, { transport });
+
+    const reply = await handlers.pulse({ activeSurface: true });
+
+    assert.equal(reply.ok, true);
+    if (!reply.ok) return;
+    assert.deepEqual(calls.sort(), ["studio-a", "studio-b"], "every peer is polled exactly once");
+    const studioA = reply.view.nodes.find((node) => node.id === "studio-a");
+    assert.ok(studioA);
+    assert.equal(studioA.online, true);
+    assert.equal(studioA.cpuPercent, 30);
+    const studioB = reply.view.nodes.find((node) => node.id === "studio-b");
+    assert.ok(studioB);
+    assert.equal(studioB.online, false);
+    assert.match(studioB.lastError ?? "", /unreachable/);
+    // The pulse published the snapshot the Connector bridge consumes.
+    assert.ok(existsSync(join(home, "connector", "fleet-state.json")));
+  });
+
+  it("gates repeat polls on the adaptive cadence — 5s while the surface is open, 60s idle", async () => {
+    const home = makeTempHome("pulse-cadence");
+    seedRegistry(home, [fleetNode({ id: "studio-a" })]);
+    const { calls, transport } = stubTransport({ "studio-a": {} });
+    let clock = new Date("2026-10-17T10:00:00.000Z");
+    const handlers = makeHandlers(home, { transport, now: () => clock });
+    const polled = () => calls.filter((id) => id === "studio-a").length;
+
+    await handlers.pulse({ activeSurface: false }); // first call always polls
+    assert.equal(polled(), 1);
+
+    clock = new Date("2026-10-17T10:00:30.000Z"); // +30s: still inside the 60s idle window
+    await handlers.pulse({ activeSurface: false });
+    assert.equal(polled(), 1, "idle gate holds for 60s");
+
+    await handlers.pulse({ activeSurface: true }); // +30s: past the 5s active window
+    assert.equal(polled(), 2, "an open surface tightens the cadence to 5s");
+
+    await handlers.pulse({ activeSurface: false }); // 0s since the last poll
+    assert.equal(polled(), 2, "the idle gate re-applies the moment the surface closes");
+
+    clock = new Date("2026-10-17T10:01:31.000Z"); // +61s since the last poll
+    await handlers.pulse({ activeSurface: false });
+    assert.equal(polled(), 3, "the idle cadence polls again after 60s");
   });
 });

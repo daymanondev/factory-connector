@@ -36,3 +36,12 @@ export const nodeReserve = defineRpc({
   input: z.object({ nodeId: z.string().min(1), reserveMode: z.boolean() }),
   output: z.union([z.object({ ok: z.literal(true), view: FleetViewSchema }), Failure]),
 });
+
+export const pulse = defineRpc({
+  name: "connector.pulse",
+  input: z.object({
+    /** True while the `Fleet surface` is open — tightens the cadence to 5s (60s idle). */
+    activeSurface: z.boolean().optional(),
+  }),
+  output: z.union([z.object({ ok: z.literal(true), view: FleetViewSchema }), Failure]),
+});
