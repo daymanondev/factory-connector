@@ -147,3 +147,75 @@ export function loadFleetConfig(paseoHome: string): FleetConfig {
 export function saveFleetConfig(paseoHome: string, config: FleetConfig): void {
   writeJsonAtomic(fleetConfigPath(paseoHome), config);
 }
+
+function assertValidNodeInput(input: FleetNodeInput): void {
+  if (typeof input.id !== "string" || input.id.trim().length === 0) {
+    throw new Error("factory-connector: Node id must be a non-empty string");
+  }
+  if (typeof input.name !== "string" || input.name.trim().length === 0) {
+    throw new Error(`factory-connector: Node ${input.id}: name must be a non-empty string`);
+  }
+  if (input.posture !== "stationary" && input.posture !== "mobile") {
+    throw new Error(
+      `factory-connector: Node ${input.id}: posture must be "stationary" or "mobile", got ${JSON.stringify(input.posture)}`,
+    );
+  }
+  if (input.slotCeiling !== undefined && (!Number.isInteger(input.slotCeiling) || input.slotCeiling < 1)) {
+    throw new Error(
+      `factory-connector: Node ${input.id}: slotCeiling must be a positive integer, got ${JSON.stringify(input.slotCeiling)}`,
+    );
+  }
+}
+
+function normalizeNode(input: FleetNodeInput): FleetNode {
+  assertValidNodeInput(input);
+  const node: FleetNode = {
+    id: input.id,
+    name: input.name,
+    posture: input.posture,
+    transport: input.transport ?? "ssh",
+    remotePaseoHome: input.remotePaseoHome ?? DEFAULT_REMOTE_PASEO_HOME,
+    slotCeiling: input.slotCeiling ?? DEFAULT_SLOT_CEILING,
+    reserveMode: input.reserveMode ?? false,
+    healthGuard: input.healthGuard ?? { ...DEFAULT_HEALTH_GUARD },
+  };
+  // Keep optional keys out of the stored shape entirely so an in-memory config
+  // deep-equals its serialized round-trip.
+  if (input.sshTarget !== undefined) node.sshTarget = input.sshTarget;
+  if (input.paseoEndpoint !== undefined) node.paseoEndpoint = input.paseoEndpoint;
+  return node;
+}
+
+/**
+ * Registers or updates a `Node` in the `Fleet` registry. Unspecified optional
+ * fields fall back to their defaults (not to previously stored values), so a
+ * full editor payload is expected when keeping custom settings.
+ */
+export function upsertNode(paseoHome: string, input: FleetNodeInput): FleetConfig {
+  const config = loadFleetConfig(paseoHome);
+  const node = normalizeNode(input);
+  const index = config.nodes.findIndex((candidate) => candidate.id === node.id);
+  if (index === -1) {
+    config.nodes.push(node);
+  } else {
+    config.nodes[index] = node;
+  }
+  saveFleetConfig(paseoHome, config);
+  return config;
+}
+
+/** Toggles `Reserve mode` (stops the `Node` accepting background delegated work). */
+export function setNodeReserveMode(
+  paseoHome: string,
+  nodeId: string,
+  reserveMode: boolean,
+): FleetConfig {
+  const config = loadFleetConfig(paseoHome);
+  const node = config.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node) {
+    throw new Error(`factory-connector: no Node with id ${JSON.stringify(nodeId)} in the Fleet`);
+  }
+  node.reserveMode = reserveMode;
+  saveFleetConfig(paseoHome, config);
+  return config;
+}
