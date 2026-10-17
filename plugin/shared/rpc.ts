@@ -8,7 +8,7 @@
  */
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { FleetNodeInputSchema, FleetViewSchema } from "./view.ts";
+import { FleetNodeInputSchema, FleetViewSchema, HandoffKindSchema, HandoffRecordViewSchema } from "./view.ts";
 
 /** Every handler's refusal shape: a stable machine code plus the human sentence. */
 export const Failure = z.object({ ok: z.literal(false), code: z.string(), error: z.string() });
@@ -44,4 +44,25 @@ export const pulse = defineRpc({
     activeSurface: z.boolean().optional(),
   }),
   output: z.union([z.object({ ok: z.literal(true), view: FleetViewSchema }), Failure]),
+});
+
+export const handoff = defineRpc({
+  name: "connector.handoff",
+  input: z.object({
+    /** Source `Project` repository to package as a `git bundle`. */
+    projectPath: z.string().min(1),
+    /** Exclusive start of the packaged `<base>..HEAD` range. */
+    base: z.string().min(1),
+    /** `Project` canonical slug naming the target `Mirror repo`. */
+    canonicalSlug: z.string().min(1),
+    kind: HandoffKindSchema,
+    runOrTaskId: z.string().min(1),
+    /** Detached command the target `Host node` executes inside its `Mirror repo`. */
+    command: z.string().min(1),
+    playbook: z.string().nullable().optional(),
+    prompt: z.string().nullable().optional(),
+    /** Explicit `Node` id or `"auto-stationary"` (the default). */
+    targetNodeId: z.string().optional(),
+  }),
+  output: z.union([z.object({ ok: z.literal(true), handoff: HandoffRecordViewSchema }), Failure]),
 });

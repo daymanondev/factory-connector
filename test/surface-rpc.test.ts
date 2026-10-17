@@ -5,9 +5,11 @@
  */
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { promisify } from "node:util";
 import {
   DEFAULT_HEALTH_GUARD,
   pollFleetPulse,
@@ -19,9 +21,18 @@ import {
   type LocalPulseSource,
   type PulseTransport,
 } from "../src/fleet.ts";
+import {
+  receiveHandoff,
+  type DetachedSpawn,
+  type GitBundleTransport,
+  type RemoteCommandRunner,
+} from "../src/dispatch.ts";
+import { createCommitBundle, stageFleetRefFromBundle } from "../src/git-sync.ts";
 import { createSurfaceHandlers } from "../plugin/server/surface-rpc.ts";
 import type { SurfaceDeps, SurfaceHandlers } from "../plugin/server/surface-rpc.ts";
 import { FleetViewSchema } from "../plugin/shared/view.ts";
+
+const execFileAsync = promisify(execFile);
 
 /** Frozen clock — pulse cadence assertions are exact, never wall-clock flaky. */
 const NOW = new Date("2026-10-17T10:00:00.000Z");
@@ -121,6 +132,87 @@ async function primeState(
     localSource: stubLocalSource,
     now: fixedNow,
   });
+}
+
+// ---- real-git fixtures (Handoff / Land ride real temporary repositories) ----------------
+
+/** Runs real `git` against a fixture checkout (tests may drive git directly). */
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args]);
+  return stdout.toString();
+}
+
+async function initRepo(dir: string, branch = "main"): Promise<string> {
+  await execFileAsync("git", ["init", "-q", "-b", branch, dir]);
+  await execFileAsync("git", ["-C", dir, "config", "user.email", "connector@test.example"]);
+  await execFileAsync("git", ["-C", dir, "config", "user.name", "Connector Test"]);
+  return dir;
+}
+
+async function commitAll(repo: string, message: string): Promise<string> {
+  await execFileAsync("git", ["-C", repo, "add", "-A"]);
+  await execFileAsync("git", ["-C", repo, "commit", "-qm", message]);
+  return (await git(repo, "rev-parse", "HEAD")).trim();
+}
+
+/** Initiating `Project` fixture: a base commit plus one commit on top (the handoff range). */
+async function makeProject(): Promise<{ repo: string; base: string; head: string }> {
+  const repo = await initRepo(join(makeTempDir("surface-project"), "proj"));
+  writeFileSync(join(repo, "playbook.txt"), "v1\n", "utf8");
+  const base = await commitAll(repo, "base");
+  writeFileSync(join(repo, "playbook.txt"), "v2\n", "utf8");
+  const head = await commitAll(repo, "head");
+  return { repo, base, head };
+}
+
+/** Stub `DetachedSpawn` that records every spawn without running anything. */
+function recordingSpawn(): { spawns: Array<{ cwd: string; command: string; logPath: string }>; spawn: DetachedSpawn } {
+  const spawns: Array<{ cwd: string; command: string; logPath: string }> = [];
+  return {
+    spawns,
+    spawn: {
+      async spawn(options) {
+        spawns.push(options);
+        return { pid: "31337" };
+      },
+    },
+  };
+}
+
+/**
+ * Simulated target `Node`: the `GitBundleTransport` really copies files into a
+ * temp target home's inbox, and the `RemoteCommandRunner` really executes the
+ * composed `connector-dispatch receive-handoff` command against that home —
+ * exactly what the production bridge on the peer would do, minus SSH.
+ */
+function simulatedTargetNode(targetHome: string, spawn: DetachedSpawn): {
+  transport: GitBundleTransport;
+  remoteRunner: RemoteCommandRunner;
+} {
+  const toTargetPath = (remote: string): string => remote.replace(/^~\/?/, `${targetHome}/`);
+  return {
+    transport: {
+      async copyToNode(_node, localPath, remoteDir) {
+        const dir = toTargetPath(remoteDir);
+        mkdirSync(dir, { recursive: true });
+        const destination = join(dir, basename(localPath));
+        copyFileSync(localPath, destination);
+        return `${remoteDir}/${basename(localPath)}`;
+      },
+    },
+    remoteRunner: {
+      async run(node, command) {
+        const match = /--manifest '([^']+)'/.exec(command);
+        if (!match) throw new Error(`unexpected remote command: ${command}`);
+        const record = await receiveHandoff({
+          paseoHome: targetHome,
+          manifestPath: toTargetPath(match[1]),
+          spawn,
+        });
+        return { stdout: `${record.pid}\n`, stderr: "" };
+      },
+    },
+  };
 }
 
 describe("connector.snapshot", () => {
@@ -370,5 +462,80 @@ describe("connector.pulse", () => {
     clock = new Date("2026-10-17T10:01:31.000Z"); // +61s since the last poll
     await handlers.pulse({ activeSurface: false });
     assert.equal(polled(), 3, "the idle cadence polls again after 60s");
+  });
+});
+
+describe("connector.handoff", () => {
+  it("transfers run ownership to the auto-selected stationary Node through the injected seams", async () => {
+    const home = makeTempHome("handoff");
+    seedRegistry(home, [fleetNode({ id: "studio-a", name: "Studio A" })]);
+    await primeState(home, stubTransport({ "studio-a": {} }).transport);
+    const { repo, base } = await makeProject();
+    const targetHome = makeTempHome("handoff-target");
+    const spawn = recordingSpawn();
+    const { transport: bundleTransport, remoteRunner } = simulatedTargetNode(targetHome, spawn.spawn);
+    const handlers = makeHandlers(home, { bundleTransport, remoteRunner });
+
+    const reply = await handlers.handoff({
+      projectPath: repo,
+      base,
+      canonicalSlug: "my-proj",
+      kind: "burn-run",
+      runOrTaskId: "run-42",
+      command: "npx burn run --playbook probe",
+      playbook: "probe",
+      prompt: "find the best model",
+    });
+
+    assert.equal(reply.ok, true, reply.ok ? "" : reply.error);
+    if (!reply.ok) return;
+    assert.equal(reply.handoff.direction, "outbound");
+    assert.equal(reply.handoff.targetNodeId, "studio-a");
+    assert.equal(reply.handoff.runOrTaskId, "run-42");
+    assert.equal(reply.handoff.expectedFleetRef, "refs/fleet/studio-a/run-42");
+    assert.equal(reply.handoff.status, "dispatched");
+    assert.match(reply.handoff.playbook ?? "", /probe/);
+
+    // The target Node really received it: mirror provisioned, run spawned, inbound record written.
+    assert.ok(existsSync(join(targetHome, "connector", "repos", "my-proj", ".git")));
+    assert.equal(spawn.spawns.length, 1);
+    assert.match(spawn.spawns[0].command, /burn run --playbook probe/);
+    const inbound = JSON.parse(
+      readFileSync(join(targetHome, "connector", "handoffs", `${reply.handoff.handoffId}.json`), "utf8"),
+    ) as { direction: string; status: string };
+    assert.equal(inbound.direction, "inbound");
+    assert.equal(inbound.status, "running");
+
+    // The outbound record lands in the Synced Fleet Runs list, and the target's slot is taken.
+    const snap = await handlers.snapshot({});
+    assert.ok(snap.ok);
+    if (!snap.ok) return;
+    assert.equal(snap.view.handoffs.length, 1);
+    assert.equal(snap.view.handoffs[0].handoffId, reply.handoff.handoffId);
+    const target = snap.view.nodes.find((node) => node.id === "studio-a");
+    assert.ok(target);
+    assert.equal(target.slotsInUse, 1);
+  });
+
+  it("refuses as data when no stationary Node is eligible", async () => {
+    const home = makeTempHome("handoff-none");
+    seedRegistry(home, [fleetNode({ id: "studio-a" })]);
+    // No pulse yet and no transport: the only peer is unreachable → auto-stationary finds nobody.
+    const handlers = makeHandlers(home, { transport: stubTransport({}).transport });
+    const { repo, base } = await makeProject();
+
+    const reply = await handlers.handoff({
+      projectPath: repo,
+      base,
+      canonicalSlug: "my-proj",
+      kind: "burn-run",
+      runOrTaskId: "run-43",
+      command: "npx burn run",
+    });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "handoff-failed");
+    assert.match(reply.error, /no eligible stationary Node/);
   });
 });

@@ -19,14 +19,15 @@ import {
   shouldPollNow,
   upsertNode,
   type CommandRunner,
+  type FleetState,
   type LocalPulseSource,
   type PulseTransport,
 } from "./core/fleet.ts";
 import type { GossipArtifactTransport } from "./core/git-sync.ts";
-import type { GitBundleTransport, RemoteCommandRunner } from "./core/dispatch.ts";
+import { dispatchHandoff, type GitBundleTransport, type HandoffRecord, type RemoteCommandRunner } from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
-import type { FleetNodeInputView, FleetView } from "../shared/view.ts";
+import { handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
+import type { FleetNodeInputView, FleetView, HandoffRecordView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
 export interface SurfaceCallContext {
@@ -65,6 +66,27 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** A `HandoffRecord` as the wire list renders it. */
+function handoffViewOf(record: HandoffRecord): HandoffRecordView {
+  return {
+    handoffId: record.handoffId,
+    direction: record.direction,
+    sourceNodeId: record.sourceNodeId,
+    targetNodeId: record.targetNodeId,
+    runOrTaskId: record.runOrTaskId,
+    kind: record.kind,
+    status: record.status,
+    playbook: record.brief.playbook,
+    prompt: record.brief.prompt,
+    canonicalSlug: record.canonicalSlug,
+    expectedFleetRef: record.expectedFleetRef,
+    dispatchedAt: record.dispatchedAt,
+    updatedAt: record.updatedAt,
+    error: record.error,
+    logPath: record.logPath,
+  };
+}
+
 export function createSurfaceHandlers(deps: SurfaceDeps) {
   const log = deps.onLog ?? (() => {});
   const failure = (code: string, error: string) => ({ ok: false as const, code, error });
@@ -72,6 +94,16 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
   /** The current view, folded over the given (or on-disk) pulse snapshot. */
   const view = (state?: Parameters<typeof foldFleetView>[0]["state"]): FleetView =>
     foldFleetView({ paseoHome: deps.paseoHome, state, now: deps.now });
+
+  /** The freshest snapshot there is — the on-disk one, or a first poll. */
+  const currentState = async (): Promise<FleetState> =>
+    loadFleetState(deps.paseoHome) ??
+    (await pollFleetPulse({
+      paseoHome: deps.paseoHome,
+      transport: deps.transport,
+      localSource: deps.localSource ?? defaultLocalPulseSource(),
+      now: deps.now,
+    }));
 
   return {
     async snapshot(_input: {}) {
@@ -144,6 +176,44 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         return failure("remove-failed", messageOf(error));
       }
     },
+
+    async handoff(input: {
+      projectPath: string;
+      base: string;
+      canonicalSlug: string;
+      kind: "burn-run" | "task";
+      runOrTaskId: string;
+      command: string;
+      playbook?: string | null;
+      prompt?: string | null;
+      targetNodeId?: string;
+    }) {
+      try {
+        const record = await dispatchHandoff({
+          paseoHome: deps.paseoHome,
+          projectPath: input.projectPath,
+          base: input.base,
+          canonicalSlug: input.canonicalSlug,
+          brief: {
+            kind: input.kind,
+            runOrTaskId: input.runOrTaskId,
+            command: input.command,
+            playbook: input.playbook ?? null,
+            prompt: input.prompt ?? null,
+          },
+          state: await currentState(),
+          targetNodeId: input.targetNodeId,
+          localRunner: deps.localRunner,
+          bundleTransport: deps.bundleTransport,
+          remoteRunner: deps.remoteRunner,
+          now: deps.now,
+        });
+        log(`handoff: ${record.handoffId} → ${record.targetNodeId} (${record.expectedFleetRef})`);
+        return { ok: true as const, handoff: handoffViewOf(record) };
+      } catch (error) {
+        return failure("handoff-failed", messageOf(error));
+      }
+    },
   };
 }
 
@@ -160,4 +230,5 @@ export function registerSurfaceRpc(server: PluginServerContext, handlers: Surfac
   server.handle(nodeRemove, (input) => handlers.nodeRemove(input));
   server.handle(nodeReserve, (input) => handlers.nodeReserve(input));
   server.handle(pulse, (input) => handlers.pulse(input));
+  server.handle(handoff, (input) => handlers.handoff(input));
 }
