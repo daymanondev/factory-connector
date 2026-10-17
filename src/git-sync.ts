@@ -56,9 +56,13 @@ export interface CommitBundle {
    * them). `null` when the repo lists no include files.
    */
   includeTarPath: string | null;
-  /** Resolved `<base>` commit sha (ancestor of `headCommit`). */
+  /**
+   * Resolved base commit sha: the bundle's recorded prerequisite for a thin
+   * update (`thinBase` the receiving mirror already holds), otherwise the
+   * validated ancestor of the packaged full-history payload.
+   */
   baseCommit: string;
-  /** Resolved `HEAD` commit sha — the tip of the packaged `<base>..HEAD` range. */
+  /** Resolved `HEAD` commit sha — the tip of the packaged range. */
   headCommit: string;
   /** Branch `HEAD` was on when the bundle was created (mirrors check it out). */
   branch: string;
@@ -134,20 +138,35 @@ export async function listWorktreeIncludeFiles(
 }
 
 /**
- * Packages an initiating repository's `<base>..HEAD` commit range plus its
- * `.worktreeinclude` files into transfer-ready artifacts.
+ * Packages an initiating repository's commit range plus its
+ * `.worktreeinclude` files into transfer-ready artifacts — two-tier payloads
+ * (spec.md §Solution 2):
  *
- * The bundle is self-contained (the range's prerequisite `<base>` history is
- * included) because a thin `git bundle create <base>..HEAD` payload records
- * `<base>` as a prerequisite and git refuses to clone/fetch it anywhere that
- * lacks those commits — which would break provisioning a fresh `Mirror repo`
- * on a peer `Node` that has never seen the project. Peers that already hold
- * the history simply deduplicate the objects on fetch.
+ * - **Full history** (default): the bundle is self-contained (the range's
+ *   prerequisite `<base>` history is included) because a thin
+ *   `git bundle create <base>..HEAD` payload records `<base>` as a
+ *   prerequisite and git refuses to clone/fetch it anywhere that lacks those
+ *   commits — which would break provisioning a fresh `Mirror repo` on a peer
+ *   `Node` that has never seen the project. Peers that already hold the
+ *   history simply deduplicate the objects on fetch.
+ * - **Thin update** (`thinBase` names a commit the receiving mirror already
+ *   holds, e.g. its current HEAD): the bundle carries only the compact
+ *   `<thinBase>..HEAD` range with `<thinBase>` as its recorded prerequisite —
+ *   exactly what an existing mirror needs, and a fraction of the bytes over
+ *   Tailscale. Any `thinBase` this repo cannot vouch for (unknown, not an
+ *   ancestor of HEAD, or equal to HEAD) silently falls back to the full
+ *   history payload, so the transfer always succeeds.
  */
 export async function createCommitBundle(options: {
   repoPath: string;
   /** Commit-ish the range starts from (exclusive). Must be an ancestor of HEAD. */
   base: string;
+  /**
+   * Commit the receiving mirror already holds: when it resolves locally, is a
+   * strict ancestor of HEAD, and differs from HEAD, the bundle is a compact
+   * thin update from it (its sha becomes `baseCommit`). Otherwise ignored.
+   */
+  thinBase?: string | null;
   /** Where the `.bundle` file is written (parent directories are created). */
   outPath: string;
   runner?: CommandRunner;
@@ -156,7 +175,25 @@ export async function createCommitBundle(options: {
   const repoPath = options.repoPath;
 
   const headCommit = (await runGit(runner, repoPath, ["rev-parse", "HEAD"])).trim();
-  const baseCommit = (await runGit(runner, repoPath, ["rev-parse", options.base])).trim();
+
+  let bundleBase = options.base;
+  let thin = false;
+  const thinBase = options.thinBase;
+  if (typeof thinBase === "string" && thinBase.trim() !== "") {
+    try {
+      const candidate = (await runGit(runner, repoPath, ["rev-parse", `${thinBase}^{commit}`])).trim();
+      if (candidate !== headCommit) {
+        await runGit(runner, repoPath, ["merge-base", "--is-ancestor", candidate, headCommit]);
+        bundleBase = candidate;
+        thin = true;
+      }
+    } catch {
+      // Unknown or non-ancestor thinBase: the self-contained payload below
+      // stays correct for any receiver — compactness is best-effort.
+    }
+  }
+
+  const baseCommit = (await runGit(runner, repoPath, ["rev-parse", bundleBase])).trim();
   try {
     await runGit(runner, repoPath, ["merge-base", "--is-ancestor", baseCommit, headCommit]);
   } catch {
@@ -172,7 +209,13 @@ export async function createCommitBundle(options: {
   const revs = branch === "HEAD" ? ["HEAD"] : ["HEAD", branch];
 
   mkdirSync(dirname(options.outPath), { recursive: true });
-  await runGit(runner, repoPath, ["bundle", "create", options.outPath, ...revs]);
+  await runGit(runner, repoPath, [
+    "bundle",
+    "create",
+    options.outPath,
+    ...(thin ? [`^${baseCommit}`] : []),
+    ...revs,
+  ]);
 
   let includeTarPath: string | null = null;
   const includeFiles = await listWorktreeIncludeFiles(repoPath, runner);

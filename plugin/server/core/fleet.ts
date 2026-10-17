@@ -159,7 +159,12 @@ export function defaultFleetConfig(): FleetConfig {
   return { version: 1, localNodeId: local.id, nodes: [local] };
 }
 
-function writeJsonAtomic(path: string, value: unknown): void {
+/**
+ * Atomically writes a JSON file (temp file + rename) so a concurrent reader
+ * never observes a torn write. Shared with `dispatch.ts`'s record/state
+ * persistence — both files mirror together into `plugin/server/core/`.
+ */
+export function writeJsonAtomic(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
@@ -208,6 +213,26 @@ function assertValidNodeInput(input: FleetNodeInput): void {
     throw new Error(
       `factory-connector: Node ${input.id}: slotCeiling must be a positive integer, got ${JSON.stringify(input.slotCeiling)}`,
     );
+  }
+  // A non-finite Health guard would make every guard comparison fail and
+  // silently bar the Node from scheduling — refuse it at the door.
+  if (input.healthGuard !== undefined) {
+    const { maxCpuPercent, minFreeMemMb } = input.healthGuard;
+    if (
+      typeof maxCpuPercent !== "number" ||
+      !Number.isFinite(maxCpuPercent) ||
+      maxCpuPercent <= 0 ||
+      maxCpuPercent > 100
+    ) {
+      throw new Error(
+        `factory-connector: Node ${input.id}: healthGuard.maxCpuPercent must be a finite number in (0, 100], got ${JSON.stringify(maxCpuPercent)}`,
+      );
+    }
+    if (typeof minFreeMemMb !== "number" || !Number.isFinite(minFreeMemMb) || minFreeMemMb < 0) {
+      throw new Error(
+        `factory-connector: Node ${input.id}: healthGuard.minFreeMemMb must be a finite number >= 0, got ${JSON.stringify(minFreeMemMb)}`,
+      );
+    }
   }
 }
 
@@ -400,7 +425,11 @@ export interface PulseTransport {
 /** Default ceiling for a single peer pulse fetch before the `Node` is marked offline. */
 export const PULSE_FETCH_TIMEOUT_MS = 10_000;
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+/**
+ * Races a promise against a deadline, rejecting with a labelled timeout.
+ * Shared with `dispatch.ts`'s pulse-fetch/attempt ceilings.
+ */
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),

@@ -8,7 +8,7 @@
  */
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
-import { BurstReportViewSchema, FleetNodeInputSchema, FleetViewSchema, GossipSyncReportViewSchema, HandoffKindSchema, HandoffRecordViewSchema, LandedFleetRefViewSchema, LandFleetRefModeSchema } from "./view.ts";
+import { BurstReportViewSchema, FleetNodeInputSchema, FleetViewSchema, GossipSyncReportViewSchema, HandoffKindSchema, HandoffLogViewSchema, HandoffRecordViewSchema, LandedFleetRefViewSchema, LandFleetRefModeSchema } from "./view.ts";
 
 /** Every handler's refusal shape: a stable machine code plus the human sentence. */
 export const Failure = z.object({ ok: z.literal(false), code: z.string(), error: z.string() });
@@ -86,6 +86,15 @@ export const gossipSync = defineRpc({
   name: "connector.gossip.sync",
   input: z.object({}),
   output: z.union([z.object({ ok: z.literal(true), report: GossipSyncReportViewSchema }), Failure]),
+});
+
+export const logRead = defineRpc({
+  name: "connector.log.read",
+  input: z.object({
+    /** The `Handoff` record whose log/report the operator asked to inspect. */
+    handoffId: z.string().min(1),
+  }),
+  output: z.union([z.object({ ok: z.literal(true), log: HandoffLogViewSchema }), Failure]),
 });
 
 export const refLand = defineRpc({

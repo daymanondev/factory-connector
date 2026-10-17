@@ -30,6 +30,8 @@ import {
   pollFleetPulse,
   saveFleetState,
   selectEligibleNodes,
+  withTimeout,
+  writeJsonAtomic,
   type CommandRunner,
   type EligibleNode,
   type FleetNode,
@@ -96,13 +98,6 @@ export function handoffStagingDir(paseoHome: string, handoffId: string): string 
 /** Path of the `<paseoHome>/connector/handoffs/<handoffId>.json` record. */
 export function handoffRecordPath(paseoHome: string, handoffId: string): string {
   return join(paseoHome, "connector", "handoffs", `${handoffId}.json`);
-}
-
-function writeJsonAtomic(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  renameSync(tmp, path);
 }
 
 function saveHandoffRecord(paseoHome: string, record: HandoffRecord): void {
@@ -277,6 +272,35 @@ export interface RemoteCommandRunner {
 /** Timeout ceiling for one remote handoff-receive invocation on a peer. */
 export const HANDOFF_RECEIVE_TIMEOUT_MS = 120_000;
 
+/** Timeout ceiling for one `Mirror repo` HEAD probe on a peer. */
+export const MIRROR_PROBE_TIMEOUT_MS = 15_000;
+
+/**
+ * Asks a `Host node` for the current HEAD of its `Mirror repo` for a slug
+ * (`git -C <remoteHome>/connector/repos/<slug> rev-parse HEAD` over the
+ * injectable remote seam). Null when the peer holds no mirror for the slug or
+ * cannot answer at all — the initiator then ships the self-contained
+ * full-history bundle (two-tier payloads, spec.md §Solution 2).
+ */
+export async function probeMirrorHead(options: {
+  node: FleetNode;
+  canonicalSlug: string;
+  remoteHome: string;
+  remoteRunner: RemoteCommandRunner;
+}): Promise<string | null> {
+  try {
+    const { stdout } = await options.remoteRunner.run(
+      options.node,
+      `git -C ${options.remoteHome}/connector/repos/${options.canonicalSlug} rev-parse HEAD`,
+      { timeoutMs: MIRROR_PROBE_TIMEOUT_MS },
+    );
+    const commit = stdout.trim().split("\n").filter((line) => line !== "").pop() ?? "";
+    return /^[0-9a-f]{40}$/.test(commit) ? commit : null;
+  } catch {
+    return null;
+  }
+}
+
 /** `ConnectTimeout` (seconds) used by the production SSH/SCP seams. */
 export const SSH_CONNECT_TIMEOUT_SECONDS = 5;
 
@@ -432,8 +456,11 @@ function selectHandoffTarget(
  * `Handoff` — full ownership transfer of a `Burn run` (or `Task`) to a `Host
  * node` so the initiating `Node` can disconnect immediately.
  *
- * Packages the source `Project`'s `<base>..HEAD` range plus `.worktreeinclude`
- * files (`createCommitBundle`), copies them into the target's
+ * Probes the target for an existing `Mirror repo` of the `Project`, then
+ * packages the source repository plus `.worktreeinclude` files
+ * (`createCommitBundle`) — a compact thin `<mirrorHead>..HEAD` bundle for a
+ * target that already holds the history, the self-contained full-history
+ * bundle for a fresh `Mirror repo` — copies them into the target's
  * `connector/inbox/<handoffId>/`, and asks the target's own
  * `connector-dispatch receive-handoff` bridge command to provision its
  * `Mirror repo` and spawn the detached run. The outbound record written to
@@ -496,9 +523,27 @@ export async function dispatchHandoff(options: {
   const handoffId = options.handoffId ?? generateHandoffId(runOrTaskId, now);
   assertPathComponent("handoff id", handoffId);
   const stagingDir = handoffStagingDir(options.paseoHome, handoffId);
+
+  const transport = options.bundleTransport ?? createScpGitBundleTransport();
+  const remoteRunner = options.remoteRunner ?? createSshRemoteCommandRunner();
+  const remoteHome = targetNode.remotePaseoHome ?? DEFAULT_REMOTE_PASEO_HOME;
+
+  // Two-tier payload: a target that already holds a `Mirror repo` for this
+  // slug gets only the compact <mirrorHead>..HEAD range as a thin bundle; a
+  // fresh Mirror (or an unanswerable probe) gets the full-history bundle a
+  // clone needs. If the mirror vanishes between probe and receive, the thin
+  // bundle fails the target's clone loudly and the handoff is recorded failed
+  // — retryable, never silent.
+  const mirrorHead = await probeMirrorHead({
+    node: targetNode,
+    canonicalSlug: options.canonicalSlug,
+    remoteHome,
+    remoteRunner,
+  });
   const bundle: CommitBundle = await createCommitBundle({
     repoPath: options.projectPath,
     base: options.base,
+    thinBase: mirrorHead,
     outPath: join(stagingDir, "commit.bundle"),
     runner: options.localRunner,
   });
@@ -533,9 +578,6 @@ export async function dispatchHandoff(options: {
   const manifestPath = join(stagingDir, MANIFEST_FILENAME);
   writeFileSync(manifestPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
 
-  const transport = options.bundleTransport ?? createScpGitBundleTransport();
-  const remoteRunner = options.remoteRunner ?? createSshRemoteCommandRunner();
-  const remoteHome = targetNode.remotePaseoHome ?? DEFAULT_REMOTE_PASEO_HOME;
   const inboxDir = `${remoteHome}/connector/inbox/${handoffId}`;
 
   try {
@@ -617,25 +659,6 @@ export interface BurstReport {
 /** Default ceiling for a single work-unit attempt before failover kicks in. */
 export const BURST_ATTEMPT_TIMEOUT_MS = 300_000;
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
-      timeoutMs,
-    );
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
 /**
  * Distributes a batch of parallel work units across the eligible online
  * `Node`s of the `Fleet` (`selectEligibleNodes` already applied `Slot
@@ -643,9 +666,10 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
  * onto the roomiest surviving candidate and never exceeding a `Node`'s free
  * slots. Any attempt that fails — a peer disconnecting or timing out
  * mid-attempt included — is transparently retried on a surviving `Node` (each
- * `Node` is tried at most once per unit). In-flight occupancy is recorded as
- * `slotsInUse` in `fleet-state.json` for the whole `Fleet` to see, and
- * released as attempts settle.
+ * `Node` is tried at most once per unit). In-flight occupancy is added on top
+ * of each `Node`'s pre-existing `slotsInUse` baseline (e.g. slots recorded by
+ * a prior `dispatchHandoff`) in `fleet-state.json` for the whole `Fleet` to
+ * see, and only the burst's own share is released as attempts settle.
  */
 export async function executeBurst(options: {
   paseoHome: string;
@@ -688,6 +712,12 @@ export async function executeBurst(options: {
 
   const remaining = new Map<string, number>(eligible.map((entry) => [entry.node.nodeId, entry.freeSlots]));
   const inFlight = new Map<string, number>(eligible.map((entry) => [entry.node.nodeId, 0]));
+  // Occupancy a previous dispatch already recorded (e.g. a handed-off run's
+  // slot) that the burst must add to, never erase: persistSlots writes
+  // baseline + in-flight, so settling releases only what the burst took.
+  const baselineSlots = new Map<string, number>(
+    eligible.map((entry) => [entry.node.nodeId, entry.node.slotsInUse]),
+  );
   // Slot bookkeeping is written into a private copy of the snapshot so peers
   // polling fleet-state.json observe live occupancy.
   const slotsState: FleetState = {
@@ -696,8 +726,8 @@ export async function executeBurst(options: {
   };
   function persistSlots(): void {
     for (const node of slotsState.nodes) {
-      const value = inFlight.get(node.nodeId);
-      if (value !== undefined) node.slotsInUse = value;
+      const baseline = baselineSlots.get(node.nodeId);
+      if (baseline !== undefined) node.slotsInUse = baseline + (inFlight.get(node.nodeId) ?? 0);
     }
     saveFleetState(options.paseoHome, slotsState);
   }

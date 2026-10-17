@@ -170,6 +170,83 @@ describe("Node registration (upsertNode)", () => {
     // Nothing was persisted by the rejected calls.
     assert.equal(loadFleetConfig(home).nodes.length, 1);
   });
+
+  it("rejects a non-finite Health guard instead of persisting a guard that silently excludes the Node", () => {
+    const home = makeTempHome();
+    // NaN / Infinity maxCpuPercent: every comparison against it fails, which
+    // would permanently bar the Node from scheduling with no error surfaced.
+    assert.throws(
+      () =>
+        upsertNode(home, {
+          id: "nan-cpu",
+          name: "NaN CPU",
+          posture: "mobile",
+          healthGuard: { maxCpuPercent: Number.NaN, minFreeMemMb: 2048 },
+        }),
+      /maxCpuPercent/,
+    );
+    assert.throws(
+      () =>
+        upsertNode(home, {
+          id: "inf-cpu",
+          name: "Inf CPU",
+          posture: "mobile",
+          healthGuard: { maxCpuPercent: Number.POSITIVE_INFINITY, minFreeMemMb: 2048 },
+        }),
+      /maxCpuPercent/,
+    );
+    assert.throws(
+      () =>
+        upsertNode(home, {
+          id: "out-of-range",
+          name: "Out of range",
+          posture: "mobile",
+          healthGuard: { maxCpuPercent: 0, minFreeMemMb: 2048 },
+        }),
+      /maxCpuPercent/,
+    );
+    assert.throws(
+      () =>
+        upsertNode(home, {
+          id: "nan-mem",
+          name: "NaN mem",
+          posture: "mobile",
+          healthGuard: { maxCpuPercent: 85, minFreeMemMb: Number.NaN },
+        }),
+      /minFreeMemMb/,
+    );
+    assert.throws(
+      () =>
+        upsertNode(home, {
+          id: "neg-mem",
+          name: "Negative mem",
+          posture: "mobile",
+          healthGuard: { maxCpuPercent: 85, minFreeMemMb: -1 },
+        }),
+      /minFreeMemMb/,
+    );
+    // A partial guard object is refused too (missing field is not a number).
+    assert.throws(
+      () =>
+        upsertNode(home, {
+          id: "partial",
+          name: "Partial",
+          posture: "mobile",
+          healthGuard: { maxCpuPercent: 85 } as never,
+        }),
+      /minFreeMemMb/,
+    );
+    // Nothing was persisted by the rejected calls.
+    assert.equal(loadFleetConfig(home).nodes.length, 1);
+    // A sane guard still registers.
+    upsertNode(home, {
+      id: "sane",
+      name: "Sane",
+      posture: "mobile",
+      healthGuard: { maxCpuPercent: 50, minFreeMemMb: 0 },
+    });
+    assert.equal(loadFleetConfig(home).nodes.length, 2);
+  });
 });
 
 describe("Reserve mode (setNodeReserveMode)", () => {

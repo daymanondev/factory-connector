@@ -83,6 +83,7 @@ function nodeViewOf(node: FleetNode, state: FleetNodeState | undefined, local: b
     posture: node.posture,
     transport: node.transport,
     sshTarget: node.sshTarget ?? null,
+    remotePaseoHome: node.remotePaseoHome ?? null,
     online: state?.online ?? false,
     cpuPercent: state?.cpuPercent ?? 0,
     freeMemMb: state?.freeMemMb ?? 0,

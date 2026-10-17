@@ -30,6 +30,12 @@ export const FleetNodeViewSchema = z.object({
   transport: NodeTransportSchema,
   /** `ssh://user@100.x.y.z?daemonPort=6767` Tailscale target (SSH Nodes only). */
   sshTarget: z.string().nullable(),
+  /**
+   * `<paseoHome>` on the remote `Node` (null when the registry entry carries
+   * none) — carried so the Node editor seeds its draft instead of silently
+   * resetting a custom remote home back to the default on save.
+   */
+  remotePaseoHome: z.string().nullable(),
   online: z.boolean(),
   cpuPercent: z.number(),
   freeMemMb: z.number(),
@@ -90,6 +96,25 @@ export const HandoffRecordViewSchema = z.object({
   logPath: z.string().nullable(),
 });
 export type HandoffRecordView = z.infer<typeof HandoffRecordViewSchema>;
+
+/**
+ * The on-demand view of one `Handoff`'s artifacts (spec.md §Solution 4): the
+ * tail of its detached-run log plus the `Gossip sync`-ed `report.md` for its
+ * run id. Both are capped digest-first (ADR 0001 §3) — a summary the operator
+ * reads, never a token/log stream.
+ */
+export const HandoffLogViewSchema = z.object({
+  handoffId: z.string(),
+  /** Where the detached run's log lives on this Node (null on the initiator). */
+  logPath: z.string().nullable(),
+  /** Last bytes of the log (null when there is no log to read yet). */
+  logTail: z.string().nullable(),
+  /** Path of the gossip-synced `report.md` this Node holds for the run. */
+  reportPath: z.string().nullable(),
+  /** The synced `report.md` content (null when the run has none locally). */
+  report: z.string().nullable(),
+});
+export type HandoffLogView = z.infer<typeof HandoffLogViewSchema>;
 
 /** The whole `Fleet surface` — one fold of everything the UI renders. */
 export const FleetViewSchema = z.object({

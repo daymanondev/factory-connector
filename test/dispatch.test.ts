@@ -1,31 +1,26 @@
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { promisify } from "node:util";
 import {
   createCommitBundle,
   stageFleetRefFromBundle,
   landFleetRef,
 } from "../src/git-sync.ts";
 import {
-  DEFAULT_HEALTH_GUARD,
-  saveFleetConfig,
   loadFleetState,
   fleetStatePath,
   type FleetState,
-  type FleetNode,
   type FleetNodeState,
 } from "../src/fleet.ts";
 import {
@@ -35,42 +30,26 @@ import {
   ensureConnectorBridge,
   loadHandoff,
   handoffRecordPath,
-  type DetachedSpawn,
+  handoffStagingDir,
   type HandoffRecord,
   type GitBundleTransport,
   type RemoteCommandRunner,
 } from "../src/dispatch.ts";
+import {
+  commitAll,
+  fleetNode,
+  fleetStateOf,
+  git,
+  initRepo,
+  makeTempDir,
+  makeTempHome,
+  nodeState,
+  recordingSpawn,
+  seedRegistry,
+  simulatedTargetNode,
+} from "./helpers.ts";
 
 const execFileAsync = promisify(execFile);
-
-/** Runs real `git` against a fixture checkout (tests may drive git directly). */
-async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args]);
-  return stdout.toString();
-}
-
-function makeTempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `factory-connector-${prefix}-`));
-  after(() => rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
-
-function makeTempHome(prefix: string): string {
-  return makeTempDir(`${prefix}-home`);
-}
-
-async function initRepo(dir: string, branch = "main"): Promise<string> {
-  await execFileAsync("git", ["init", "-q", "-b", branch, dir]);
-  await execFileAsync("git", ["-C", dir, "config", "user.email", "connector@test.example"]);
-  await execFileAsync("git", ["-C", dir, "config", "user.name", "Connector Test"]);
-  return dir;
-}
-
-async function commitAll(repo: string, message: string): Promise<string> {
-  await execFileAsync("git", ["-C", repo, "add", "-A"]);
-  await execFileAsync("git", ["-C", repo, "commit", "-qm", message]);
-  return (await git(repo, "rev-parse", "HEAD")).trim();
-}
 
 /**
  * Initiating `Project` fixture: a base commit, a `.worktreeinclude`-listed
@@ -90,109 +69,6 @@ async function makeProjectWithInclude(): Promise<{
   writeFileSync(join(repo, ".env"), "TOKEN=hush\n", "utf8");
   const head = await commitAll(repo, "head");
   return { repo, base, head };
-}
-
-/** Stub `DetachedSpawn` that records every spawn without running anything. */
-function recordingSpawn(): { spawns: Array<{ cwd: string; command: string; logPath: string }>; spawn: DetachedSpawn } {
-  const spawns: Array<{ cwd: string; command: string; logPath: string }> = [];
-  return {
-    spawns,
-    spawn: {
-      async spawn(options) {
-        spawns.push(options);
-        return { pid: "31337" };
-      },
-    },
-  };
-}
-
-function fleetNode(overrides: Partial<FleetNode> & { id: string }): FleetNode {
-  return {
-    name: overrides.id,
-    posture: "stationary",
-    transport: "ssh",
-    sshTarget: `ssh://andrew@100.101.102.${100 + overrides.id.length}?daemonPort=6767`,
-    remotePaseoHome: "~/.paseo-factory",
-    slotCeiling: 2,
-    reserveMode: false,
-    healthGuard: { ...DEFAULT_HEALTH_GUARD },
-    ...overrides,
-  };
-}
-
-function nodeState(overrides: Partial<FleetNodeState> & { nodeId: string }): FleetNodeState {
-  return {
-    online: true,
-    cpuPercent: 10,
-    freeMemMb: 8192,
-    activeAgents: 0,
-    activeBurnRuns: 0,
-    meterSummary: null,
-    freePoolUpdatedAt: null,
-    runsUpdatedAt: null,
-    collectedAt: "2026-10-17T10:00:00.000Z",
-    name: overrides.nodeId,
-    posture: "stationary",
-    slotCeiling: 2,
-    reserveMode: false,
-    healthGuard: { ...DEFAULT_HEALTH_GUARD },
-    slotsInUse: 0,
-    lastError: null,
-    ...overrides,
-  };
-}
-
-function fleetStateOf(nodes: FleetNodeState[], localNodeId = "laptop"): FleetState {
-  return { version: 1, localNodeId, updatedAt: "2026-10-17T10:00:00.000Z", nodes };
-}
-
-/** Persists a registry whose local `Node` is the `laptop` (mobile initiator). */
-function seedRegistry(home: string, nodes: FleetNode[]): void {
-  saveFleetConfig(home, {
-    version: 1,
-    localNodeId: "laptop",
-    nodes: [fleetNode({ id: "laptop", name: "Laptop", posture: "mobile", transport: "local" }), ...nodes],
-  });
-}
-
-/**
- * Simulated target `Node`: the `GitBundleTransport` really copies files into a
- * temp target home's inbox, and the `RemoteCommandRunner` really executes the
- * composed `connector-dispatch receive-handoff` command against that home —
- * exactly what the production bridge on the peer would do, minus SSH.
- */
-function simulatedTargetNode(targetHome: string, spawn: DetachedSpawn): {
-  transport: GitBundleTransport;
-  remoteRunner: RemoteCommandRunner;
-  commands: Array<{ nodeId: string; command: string }>;
-} {
-  const commands: Array<{ nodeId: string; command: string }> = [];
-  const toTargetPath = (remote: string): string => remote.replace(/^~\/?/, `${targetHome}/`);
-  return {
-    commands,
-    transport: {
-      async copyToNode(_node, localPath, remoteDir) {
-        const dir = toTargetPath(remoteDir);
-        mkdirSync(dir, { recursive: true });
-        const destination = join(dir, basename(localPath));
-        copyFileSync(localPath, destination);
-        return `${remoteDir}/${basename(localPath)}`;
-      },
-    },
-    remoteRunner: {
-      async run(node, command) {
-        commands.push({ nodeId: node.id, command });
-        const match = /--manifest '([^']+)'/.exec(command);
-        if (!match) throw new Error(`unexpected remote command: ${command}`);
-        const record = await receiveHandoff({
-          paseoHome: targetHome,
-          manifestPath: toTargetPath(match[1]),
-          spawn,
-        });
-        return { stdout: `${record.pid}\n`, stderr: "" };
-      },
-    },
-  };
 }
 
 describe("receiveHandoff (target Node side)", () => {
@@ -353,16 +229,21 @@ describe("dispatchHandoff (initiating Node side)", () => {
     assert.equal(record.bundle.baseCommit, base);
     assert.deepEqual(loadHandoff(initiatorHome, "ho-1"), record);
 
-    // The remote side was asked to receive via the peer's own bridge binary.
-    assert.equal(commands.length, 1);
+    // The initiator probed the target's Mirror before packaging (no mirror
+    // yet), then asked the remote side to receive via the peer's own bridge
+    // binary — two remote commands, probe first.
+    assert.equal(commands.length, 2);
     assert.equal(commands[0].nodeId, "studio-a");
+    assert.ok(commands[0].command.includes("rev-parse HEAD"), commands[0].command);
+    const receive = commands[1];
+    assert.equal(receive.nodeId, "studio-a");
     assert.ok(
-      commands[0].command.includes(
+      receive.command.includes(
         "~/.paseo-factory/connector/bin/connector-dispatch receive-handoff --manifest",
       ),
-      `unexpected remote command: ${commands[0].command}`,
+      `unexpected remote command: ${receive.command}`,
     );
-    assert.ok(commands[0].command.includes("~/.paseo-factory/connector/inbox/ho-1/handoff.json"));
+    assert.ok(receive.command.includes("~/.paseo-factory/connector/inbox/ho-1/handoff.json"));
 
     // Target side is fully self-sufficient (initiator may disconnect now).
     const mirrorPath = join(targetHome, "connector", "repos", "my-proj");
@@ -403,8 +284,9 @@ describe("dispatchHandoff (initiating Node side)", () => {
     // studio-a has 1 free slot, studio-b 1 free slot, peer-laptop 2 but mobile:
     // stationary wins; among the stationary pair selectEligibleNodes breaks the
     // free-slot tie by lower CPU then id order (both cpu 10 → studio-a first).
-    assert.equal(commands.length, 1);
-    assert.equal(commands[0].nodeId, "studio-a");
+    const receives = commands.filter((entry) => entry.command.includes("receive-handoff"));
+    assert.equal(receives.length, 1);
+    assert.equal(receives[0].nodeId, "studio-a");
   });
 
   it("honours an explicit targetNodeId", async () => {
@@ -426,7 +308,9 @@ describe("dispatchHandoff (initiating Node side)", () => {
     });
 
     assert.equal(record.targetNodeId, "studio-b");
-    assert.equal(commands[0].nodeId, "studio-b");
+    const receives = commands.filter((entry) => entry.command.includes("receive-handoff"));
+    assert.equal(receives.length, 1);
+    assert.equal(receives[0].nodeId, "studio-b");
     assert.equal(record.expectedFleetRef, "refs/fleet/studio-b/run-42");
   });
 
@@ -541,6 +425,55 @@ describe("dispatchHandoff (initiating Node side)", () => {
     assert.ok(failed);
     assert.equal(failed.status, "failed");
     assert.match(failed.error ?? "", /connection reset/);
+  });
+
+  it("re-handoff to a peer with an existing Mirror ships a compact thin bundle (two-tier payloads)", async () => {
+    const { repo, base, head } = await makeProjectWithInclude();
+    const { initiatorHome, state } = seededFleet();
+    const targetHome = makeTempHome("dispatch-target");
+    const { spawn } = recordingSpawn();
+    const { transport, remoteRunner, commands } = simulatedTargetNode(targetHome, spawn);
+    const common = {
+      paseoHome: initiatorHome,
+      projectPath: repo,
+      base,
+      canonicalSlug: "my-proj",
+      brief,
+      state,
+      targetNodeId: "studio-a",
+      bundleTransport: transport,
+      remoteRunner,
+      now: () => dispatchedAt,
+    } as const;
+
+    // First transfer: the peer holds no Mirror for the slug yet, so the probe
+    // answers nothing and the bundle carries the full history (no prerequisites).
+    const first = await dispatchHandoff({ ...common, handoffId: "ho-full" });
+    const firstHeader = readFileSync(
+      join(handoffStagingDir(initiatorHome, "ho-full"), "commit.bundle"),
+      "latin1",
+    ).slice(0, 2048);
+    assert.ok(!/^-/m.test(firstHeader), "first payload is self-contained");
+    assert.equal(first.bundle.baseCommit, base);
+
+    // The initiator advances one commit and hands the same project off again.
+    writeFileSync(join(repo, "playbook.txt"), "v3\n", "utf8");
+    const newHead = await commitAll(repo, "advance");
+
+    const second = await dispatchHandoff({ ...common, handoffId: "ho-thin" });
+    // The peer's existing Mirror HEAD became the bundle's prerequisite…
+    const thinHeader = readFileSync(
+      join(handoffStagingDir(initiatorHome, "ho-thin"), "commit.bundle"),
+      "latin1",
+    ).slice(0, 2048);
+    assert.ok(thinHeader.includes(`-${head}`), "mirror HEAD recorded as prerequisite");
+    assert.equal(second.bundle.baseCommit, head);
+    assert.equal(second.bundle.headCommit, newHead);
+    // …the probe rode the remote seam before packaging…
+    assert.ok(commands.some((entry) => entry.command.includes("rev-parse HEAD")));
+    // …and the target's Mirror fast-forwarded to the advanced commit.
+    const mirrorPath = join(targetHome, "connector", "repos", "my-proj");
+    assert.equal((await git(mirrorPath, "rev-parse", "HEAD")).trim(), newHead);
   });
 
   it("survives initiator disconnect: the target completes autonomously and the recorded Fleet ref reconciles on reconnect", async () => {
@@ -763,6 +696,38 @@ describe("executeBurst (cooperative parallel execution)", () => {
     assert.equal(report.results[0].nodeId, "laptop");
     assert.equal(report.results[0].attempts[0].stdout, "local-ok");
     assert.deepEqual(localCalls, [{ command: "sh", args: ["-c", "echo local"] }]);
+  });
+
+  it("preserves pre-existing handoff-recorded slotsInUse on eligible Nodes (baseline + in-flight)", async () => {
+    const initiatorHome = makeTempHome("burst-baseline");
+    seedRegistry(initiatorHome, [
+      fleetNode({ id: "studio-a", name: "Studio A", posture: "stationary", slotCeiling: 3 }),
+    ]);
+    // studio-a already hosts a handed-off run (1 of 3 slots) before the burst;
+    // the laptop is saturated, so the burst can only land on studio-a.
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", name: "Laptop", posture: "mobile", slotCeiling: 2, slotsInUse: 2 }),
+      nodeState({ nodeId: "studio-a", name: "Studio A", posture: "stationary", slotCeiling: 3, slotsInUse: 1 }),
+    ]);
+    const { runner, recording } = recordingPeers(initiatorHome, () => ({ ok: true, delayMs: 25 }));
+
+    const report = await executeBurst({
+      paseoHome: initiatorHome,
+      state,
+      units: [{ id: "probe-1", command: "scout --model a" }],
+      remoteRunner: runner,
+      now: () => burstStartedAt,
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(report.results[0].nodeId, "studio-a");
+    // While the unit ran, the snapshot showed the handoff's slot plus the burst's.
+    assert.equal(Math.max(...recording.get("studio-a")!.observedSlots), 2);
+    // Once the burst settled, the handed-off run's slot is still accounted —
+    // the burst must release only what it took, never the baseline occupancy.
+    const settled = loadFleetState(initiatorHome);
+    assert.ok(settled);
+    assert.equal(settled.nodes.find((node) => node.nodeId === "studio-a")?.slotsInUse, 1);
   });
 
   it("refuses to burst when no Node is eligible", async () => {

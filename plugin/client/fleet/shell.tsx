@@ -15,6 +15,7 @@ import { ScrollView, Text, View } from "react-native";
 import {
   gossipSync,
   handoff,
+  logRead,
   nodeRemove,
   nodeReserve,
   nodeUpsert,
@@ -25,6 +26,7 @@ import {
 import type {
   FleetNodeView,
   FleetView,
+  HandoffLogView,
   HandoffRecordView,
 } from "../../shared/view.ts";
 import { Btn, Card, Pill } from "../kit/pill.tsx";
@@ -103,7 +105,9 @@ function draftOf(node: FleetNodeView): NodeDraft {
     posture: node.posture,
     transport: node.transport,
     sshTarget: node.sshTarget ?? "",
-    remotePaseoHome: "~/.paseo-factory",
+    // Seed from the registry's stored remote home so saving an untouched
+    // editor keeps a custom remotePaseoHome instead of resetting it.
+    remotePaseoHome: node.remotePaseoHome ?? "~/.paseo-factory",
     slotCeiling: String(node.slotCeiling),
     maxCpuPercent: String(node.healthGuard.maxCpuPercent),
     minFreeMemMb: String(node.healthGuard.minFreeMemMb),
@@ -146,6 +150,7 @@ export function FleetShell({
   const gossipCall = useRpc(gossipSync);
   const landCall = useRpc(refLand);
   const discoverCall = useRpc(tailscaleDiscover);
+  const logCall = useRpc(logRead);
 
   const [bump, setBump] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -153,6 +158,7 @@ export function FleetShell({
   const [peers, setPeers] = useState<{ id: string; name: string; tailscaleIp: string; online: boolean; os: string }[] | null>(null);
   const [handoffForm, setHandoffForm] = useState<HandoffDraft | null>(null);
   const [landTarget, setLandTarget] = useState<{ nodeId: string; runOrTaskId: string; repoPath: string; mode: "checkout" | "merge" } | null>(null);
+  const [logView, setLogView] = useState<{ record: HandoffRecordView; log: HandoffLogView } | null>(null);
   const refresh = () => setBump((n) => n + 1);
 
   const poll = usePoll(
@@ -286,6 +292,15 @@ export function FleetShell({
     });
   };
 
+  /** On-demand log/report inspection (spec.md §Solution 4) — capped digest-first server-side. */
+  const viewLog = (record: HandoffRecordView): void => {
+    void act("Log", async () => {
+      const reply = await logCall({ handoffId: record.handoffId });
+      if (reply.ok) setLogView({ record, log: reply.log });
+      return reply;
+    });
+  };
+
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.surface0 }}>
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: SPACING[4], paddingBottom: SPACING[6], gap: SPACING[4] }}>
@@ -343,6 +358,7 @@ export function FleetShell({
                 onLand={() =>
                   setLandTarget({ nodeId: record.targetNodeId, runOrTaskId: record.runOrTaskId, repoPath: dir ?? "", mode: "checkout" })
                 }
+                onViewLog={() => viewLog(record)}
               />
             )
           ))}
@@ -384,6 +400,15 @@ export function FleetShell({
           onClose={() => setLandTarget(null)}
         />
       ) : null}
+
+      {logView !== null ? (
+        <LogDialog
+          theme={theme}
+          record={logView.record}
+          log={logView.log}
+          onClose={() => setLogView(null)}
+        />
+      ) : null}
     </View>
   );
 }
@@ -419,6 +444,14 @@ function NodeCard({
         <Text style={text(theme, "meta")}>slots {node.slotsInUse}/{node.slotCeiling}</Text>
         <Text style={text(theme, "meta")}>agents {node.activeAgents} · runs {node.activeBurnRuns}</Text>
       </View>
+      {node.meterSummary !== null ? (
+        <Text style={text(theme, "meta")} numberOfLines={2}>
+          meters{" "}
+          {Object.entries(node.meterSummary)
+            .map(([key, value]) => `${key} ${typeof value === "number" ? Math.round(value * 100) / 100 : value}`)
+            .join(" · ")}
+        </Text>
+      ) : null}
       {node.lastError !== null ? <Text style={text(theme, "label", "statusWarning")} numberOfLines={2}>{node.lastError}</Text> : null}
       <View style={{ flexDirection: "row", gap: SPACING[2], flexWrap: "wrap" }}>
         <Btn
@@ -446,12 +479,14 @@ function HandoffRow({
   busy,
   dir,
   onLand,
+  onViewLog,
 }: {
   theme: PluginTheme;
   record: HandoffRecordView;
   busy: boolean;
   dir?: string;
   onLand: () => void;
+  onViewLog: () => void;
 }) {
   const tone =
     record.status === "failed" ? "statusDanger" : record.status === "completed" ? "statusSuccess" : record.status === "running" ? "accent" : "foregroundMuted";
@@ -468,9 +503,53 @@ function HandoffRow({
       {record.error !== null ? <Text style={text(theme, "label", "statusWarning")} numberOfLines={2}>{record.error}</Text> : null}
       <View style={{ flexDirection: "row", gap: SPACING[2], flexWrap: "wrap" }}>
         <Btn theme={theme} small label="Land Branch" icon="GitBranch" disabled={busy} onPress={onLand} />
+        <Btn theme={theme} small label="View Log" icon="FileText" disabled={busy} onPress={onViewLog} />
         {dir !== undefined ? <Text style={text(theme, "meta")}>lands into {dir}</Text> : null}
       </View>
     </Card>
+  );
+}
+
+/** The on-demand log/report viewer modal (spec.md §Solution 4). */
+function LogDialog({
+  theme,
+  record,
+  log,
+  onClose,
+}: {
+  theme: PluginTheme;
+  record: HandoffRecordView;
+  log: HandoffLogView;
+  onClose: () => void;
+}) {
+  return (
+    <Modal title={`Log ${record.runOrTaskId}`} icon="FileText" open onOpenChange={(open) => (open ? undefined : onClose())}>
+      <Modal.Content>
+        {log.logTail !== null ? (
+          <>
+            <Text style={text(theme, "meta")}>{log.logPath}</Text>
+            <ScrollView style={{ maxHeight: 320 }} nestedScrollEnabled>
+              <Text style={text(theme, "code")}>{log.logTail}</Text>
+            </ScrollView>
+          </>
+        ) : (
+          <Text style={text(theme, "meta")}>No log on this Node (the run executes on its Host node{log.logPath === null ? "" : `, expected at ${log.logPath}`}).</Text>
+        )}
+        {log.report !== null ? (
+          <>
+            <Text style={text(theme, "section")}>Gossip-synced report</Text>
+            <ScrollView style={{ maxHeight: 240 }} nestedScrollEnabled>
+              <Text style={text(theme, "code")}>{log.report}</Text>
+            </ScrollView>
+          </>
+        ) : (
+          <Text style={text(theme, "meta")}>No synced report.md for this run yet.</Text>
+        )}
+        <View style={{ flexDirection: "row", gap: SPACING[2], paddingTop: SPACING[2] }}>
+          <Btn theme={theme} label="Close" tone="foregroundMuted" onPress={onClose} />
+        </View>
+      </Modal.Content>
+    </Modal>
   );
 }
 
@@ -533,7 +612,10 @@ function NodeEditor({
                     id: peer.id,
                     name: peer.name,
                     transport: "ssh",
-                    sshTarget: `ssh://andrew@${peer.tailscaleIp}?daemonPort=6767`,
+                    // No user in the prefill: SSH then uses the local default,
+                    // and the operator edits in the right user per peer (e.g.
+                    // the Windows WSL2 Node) instead of inheriting one baked in.
+                    sshTarget: `ssh://${peer.tailscaleIp}?daemonPort=6767`,
                   })
                 }
               />

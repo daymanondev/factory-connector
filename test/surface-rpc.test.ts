@@ -3,73 +3,40 @@
  * temp injected paseo home: every network/SSH/git seam is stubbed, so nothing
  * here ever touches the real `~/.paseo-factory`, `~/.paseo`, or the network.
  */
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
-  DEFAULT_HEALTH_GUARD,
   pollFleetPulse,
-  saveFleetConfig,
-  type FleetNode,
-  type FleetNodeState,
   type FleetPulse,
   type FleetState,
   type LocalPulseSource,
   type PulseTransport,
 } from "../src/fleet.ts";
-import {
-  receiveHandoff,
-  type DetachedSpawn,
-  type GitBundleTransport,
-  type RemoteCommandRunner,
-} from "../src/dispatch.ts";
 import { createCommitBundle, stageFleetRefFromBundle, type GossipArtifactTransport } from "../src/git-sync.ts";
 import { createSurfaceHandlers } from "../plugin/server/surface-rpc.ts";
 import type { SurfaceDeps, SurfaceHandlers } from "../plugin/server/surface-rpc.ts";
 import { FleetViewSchema } from "../plugin/shared/view.ts";
+import {
+  fleetNode,
+  git,
+  initRepo,
+  commitAll,
+  makeTempDir,
+  makeTempHome,
+  recordingSpawn,
+  seedRegistry,
+  simulatedTargetNode,
+} from "./helpers.ts";
 
 const execFileAsync = promisify(execFile);
 
 /** Frozen clock — pulse cadence assertions are exact, never wall-clock flaky. */
 const NOW = new Date("2026-10-17T10:00:00.000Z");
 const fixedNow = () => NOW;
-
-function makeTempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `factory-connector-${prefix}-`));
-  after(() => rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
-
-function makeTempHome(prefix: string): string {
-  return makeTempDir(`${prefix}-home`);
-}
-
-function fleetNode(overrides: Partial<FleetNode> & { id: string }): FleetNode {
-  return {
-    name: overrides.id,
-    posture: "stationary",
-    transport: "ssh",
-    sshTarget: `ssh://andrew@100.101.102.${100 + overrides.id.length}?daemonPort=6767`,
-    remotePaseoHome: "~/.paseo-factory",
-    slotCeiling: 2,
-    reserveMode: false,
-    healthGuard: { ...DEFAULT_HEALTH_GUARD },
-    ...overrides,
-  };
-}
-
-/** Persists a registry whose local `Node` is the `laptop` (mobile initiator). */
-function seedRegistry(home: string, nodes: FleetNode[]): void {
-  saveFleetConfig(home, {
-    version: 1,
-    localNodeId: "laptop",
-    nodes: [fleetNode({ id: "laptop", name: "Laptop", posture: "mobile", transport: "local" }), ...nodes],
-  });
-}
 
 function pulseOf(nodeId: string, overrides: Partial<FleetPulse> = {}): FleetPulse {
   return {
@@ -136,25 +103,6 @@ async function primeState(
 
 // ---- real-git fixtures (Handoff / Land ride real temporary repositories) ----------------
 
-/** Runs real `git` against a fixture checkout (tests may drive git directly). */
-async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args]);
-  return stdout.toString();
-}
-
-async function initRepo(dir: string, branch = "main"): Promise<string> {
-  await execFileAsync("git", ["init", "-q", "-b", branch, dir]);
-  await execFileAsync("git", ["-C", dir, "config", "user.email", "connector@test.example"]);
-  await execFileAsync("git", ["-C", dir, "config", "user.name", "Connector Test"]);
-  return dir;
-}
-
-async function commitAll(repo: string, message: string): Promise<string> {
-  await execFileAsync("git", ["-C", repo, "add", "-A"]);
-  await execFileAsync("git", ["-C", repo, "commit", "-qm", message]);
-  return (await git(repo, "rev-parse", "HEAD")).trim();
-}
-
 /** Initiating `Project` fixture: a base commit plus one commit on top (the handoff range). */
 async function makeProject(): Promise<{ repo: string; base: string; head: string }> {
   const repo = await initRepo(join(makeTempDir("surface-project"), "proj"));
@@ -163,56 +111,6 @@ async function makeProject(): Promise<{ repo: string; base: string; head: string
   writeFileSync(join(repo, "playbook.txt"), "v2\n", "utf8");
   const head = await commitAll(repo, "head");
   return { repo, base, head };
-}
-
-/** Stub `DetachedSpawn` that records every spawn without running anything. */
-function recordingSpawn(): { spawns: Array<{ cwd: string; command: string; logPath: string }>; spawn: DetachedSpawn } {
-  const spawns: Array<{ cwd: string; command: string; logPath: string }> = [];
-  return {
-    spawns,
-    spawn: {
-      async spawn(options) {
-        spawns.push(options);
-        return { pid: "31337" };
-      },
-    },
-  };
-}
-
-/**
- * Simulated target `Node`: the `GitBundleTransport` really copies files into a
- * temp target home's inbox, and the `RemoteCommandRunner` really executes the
- * composed `connector-dispatch receive-handoff` command against that home —
- * exactly what the production bridge on the peer would do, minus SSH.
- */
-function simulatedTargetNode(targetHome: string, spawn: DetachedSpawn): {
-  transport: GitBundleTransport;
-  remoteRunner: RemoteCommandRunner;
-} {
-  const toTargetPath = (remote: string): string => remote.replace(/^~\/?/, `${targetHome}/`);
-  return {
-    transport: {
-      async copyToNode(_node, localPath, remoteDir) {
-        const dir = toTargetPath(remoteDir);
-        mkdirSync(dir, { recursive: true });
-        const destination = join(dir, basename(localPath));
-        copyFileSync(localPath, destination);
-        return `${remoteDir}/${basename(localPath)}`;
-      },
-    },
-    remoteRunner: {
-      async run(node, command) {
-        const match = /--manifest '([^']+)'/.exec(command);
-        if (!match) throw new Error(`unexpected remote command: ${command}`);
-        const record = await receiveHandoff({
-          paseoHome: targetHome,
-          manifestPath: toTargetPath(match[1]),
-          spawn,
-        });
-        return { stdout: `${record.pid}\n`, stderr: "" };
-      },
-    },
-  };
 }
 
 describe("connector.snapshot", () => {
@@ -265,6 +163,25 @@ describe("connector.snapshot", () => {
     assert.equal(studio.cpuPercent, 0);
     assert.equal(studio.collectedAt, null);
     assert.equal(studio.lastError, null);
+  });
+
+  it("carries each Node's remotePaseoHome so the editor never silently resets it", async () => {
+    const home = makeTempHome("snapshot-remote-home");
+    seedRegistry(home, [fleetNode({ id: "studio-a", remotePaseoHome: "/srv/paseo-factory" })]);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.snapshot({});
+
+    assert.equal(reply.ok, true);
+    if (!reply.ok) return;
+    // The wire contract carries the registry's remote home for every Node.
+    const parsed = FleetViewSchema.parse(reply.view);
+    const studio = parsed.nodes.find((node) => node.id === "studio-a");
+    assert.ok(studio);
+    assert.equal(studio.remotePaseoHome, "/srv/paseo-factory");
+    const local = parsed.nodes.find((node) => node.id === "laptop");
+    assert.ok(local);
+    assert.equal(local.remotePaseoHome, "~/.paseo-factory");
   });
 });
 
@@ -709,6 +626,103 @@ describe("connector.ref.land", () => {
     if (reply.ok) return;
     assert.equal(reply.code, "land-failed");
     assert.match(reply.error, /not staged/);
+  });
+});
+
+describe("connector.log.read", () => {
+  /** Writes an inbound `Handoff` record whose run executed on this Node. */
+  function seedHandoffRecord(
+    home: string,
+    record: { handoffId: string; runOrTaskId: string; logPath: string | null },
+  ): void {
+    mkdirSync(join(home, "connector", "handoffs"), { recursive: true });
+    writeFileSync(
+      join(home, "connector", "handoffs", `${record.handoffId}.json`),
+      JSON.stringify(
+        {
+          version: 1,
+          handoffId: record.handoffId,
+          direction: "inbound",
+          sourceNodeId: "laptop",
+          targetNodeId: "studio-a",
+          runOrTaskId: record.runOrTaskId,
+          kind: "burn-run",
+          status: "running",
+          brief: { command: "npx burn run", playbook: null, prompt: null },
+          canonicalSlug: "my-proj",
+          bundle: {
+            fileName: "commit.bundle",
+            includeTarFileName: null,
+            baseCommit: "0".repeat(40),
+            headCommit: "1".repeat(40),
+            branch: "main",
+          },
+          expectedFleetRef: `refs/fleet/studio-a/${record.runOrTaskId}`,
+          mirrorPath: null,
+          pid: "31337",
+          logPath: record.logPath,
+          dispatchedAt: NOW.toISOString(),
+          startedAt: NOW.toISOString(),
+          updatedAt: NOW.toISOString(),
+          error: null,
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  }
+
+  it("serves the handoff log tail and the gossip-synced report, capped digest-first", async () => {
+    const home = makeTempHome("log-read");
+    // An inbound record whose detached run wrote a log well past the cap…
+    const logPath = join(home, "connector", "handoffs", "ho-9.log");
+    const lines = Array.from({ length: 7000 }, (_, i) => `line-${String(i).padStart(4, "0")}`);
+    mkdirSync(dirname(logPath), { recursive: true });
+    writeFileSync(logPath, `${lines.join("\n")}\n`, "utf8");
+    seedHandoffRecord(home, { handoffId: "ho-9", runOrTaskId: "run-42", logPath });
+    // …plus a gossip-synced report.md under the run's id, and an outbound
+    // record on the initiator side whose logPath is null.
+    const reportPath = join(home, "burn-lab", "runs", "run-42", "report.md");
+    mkdirSync(dirname(reportPath), { recursive: true });
+    writeFileSync(reportPath, "# run-42 report\n", "utf8");
+    seedHandoffRecord(home, { handoffId: "ho-out", runOrTaskId: "run-43", logPath: null });
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.logRead({ handoffId: "ho-9" });
+
+    assert.equal(reply.ok, true, reply.ok ? "" : reply.error);
+    if (!reply.ok) return;
+    assert.equal(reply.log.logPath, logPath);
+    assert.ok(reply.log.logTail !== null, "the log tail is served");
+    assert.ok(reply.log.logTail.includes("line-6999"), "the tail reaches the log's end");
+    assert.ok(!reply.log.logTail.includes("line-0000"), "the head was truncated away");
+    assert.ok(
+      Buffer.byteLength(reply.log.logTail, "utf8") <= 64 * 1024 + 200,
+      "digest-first cap holds",
+    );
+    assert.equal(reply.log.report, "# run-42 report\n");
+    assert.equal(reply.log.reportPath, reportPath);
+
+    // An outbound record with no local log still answers (report-only view).
+    const outbound = await handlers.logRead({ handoffId: "ho-out" });
+    assert.equal(outbound.ok, true);
+    if (!outbound.ok) return;
+    assert.equal(outbound.log.logPath, null);
+    assert.equal(outbound.log.logTail, null);
+  });
+
+  it("refuses as data for a handoff this Node has no record of", async () => {
+    const home = makeTempHome("log-read-unknown");
+    seedRegistry(home, []);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.logRead({ handoffId: "ho-404" });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "unknown-handoff");
+    assert.match(reply.error, /ho-404/);
   });
 });
 

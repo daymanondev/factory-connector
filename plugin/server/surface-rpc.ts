@@ -9,6 +9,8 @@
  * temp paseo home, production defaults to Tailscale SSH in BatchMode.
  */
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { join } from "node:path";
 import {
   defaultLocalPulseSource,
   discoverTailscalePeers,
@@ -25,17 +27,18 @@ import {
   type LocalPulseSource,
   type PulseTransport,
 } from "./core/fleet.ts";
-import { createSshGossipTransport, landFleetRef, reconcileGossipSync, type GossipArtifactTransport } from "./core/git-sync.ts";
+import { burnRunsDirPath, createSshGossipTransport, landFleetRef, reconcileGossipSync, type GossipArtifactTransport } from "./core/git-sync.ts";
 import {
   dispatchHandoff,
   executeBurst,
+  loadHandoff,
   type GitBundleTransport,
   type HandoffRecord,
   type RemoteCommandRunner,
 } from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { burst, gossipSync, handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, refLand, snapshot, tailscaleDiscover } from "../shared/rpc.ts";
-import type { BurstReportView, FleetNodeInputView, FleetView, GossipSyncReportView, HandoffRecordView, LandedFleetRefView } from "../shared/view.ts";
+import { burst, gossipSync, handoff, logRead, nodeRemove, nodeReserve, nodeUpsert, pulse, refLand, snapshot, tailscaleDiscover } from "../shared/rpc.ts";
+import type { BurstReportView, FleetNodeInputView, FleetView, GossipSyncReportView, HandoffLogView, HandoffRecordView, LandedFleetRefView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
 export interface SurfaceCallContext {
@@ -74,6 +77,33 @@ export interface SurfaceDeps {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Digest-first ceiling (ADR 0001 §3) on any log/report the on-demand viewer
+ * serves to the `Fleet surface`: the operator reads a capped tail, never a
+ * token/log stream.
+ */
+export const LOG_READ_MAX_BYTES = 64 * 1024;
+
+/** Reads at most the last `maxBytes` of a file; null when it cannot be read. */
+function readTail(path: string, maxBytes: number): string | null {
+  let handle: number;
+  try {
+    handle = openSync(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const size = statSync(path).size;
+    const length = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    readSync(handle, buffer, 0, length, Math.max(0, size - length));
+    const content = buffer.toString("utf8");
+    return size > maxBytes ? `… [truncated to the last ${maxBytes} bytes]\n${content}` : content;
+  } finally {
+    closeSync(handle);
+  }
 }
 
 /** A `HandoffRecord` as the wire list renders it. */
@@ -295,6 +325,39 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
       }
     },
 
+    async logRead(input: { handoffId: string }) {
+      try {
+        const record = loadHandoff(deps.paseoHome, input.handoffId);
+        if (!record) {
+          return failure(
+            "unknown-handoff",
+            `no Handoff record ${JSON.stringify(input.handoffId)} on this Node`,
+          );
+        }
+        // The log lives where the run executed: on the target (inbound record)
+        // — an initiator's outbound record has no local log to serve.
+        const logTail = record.logPath !== null ? readTail(record.logPath, LOG_READ_MAX_BYTES) : null;
+        // The gossip-synced report this Node holds for the run, when it has one.
+        const reportPath = join(
+          burnRunsDirPath(deps.paseoHome),
+          record.runOrTaskId,
+          "report.md",
+        );
+        const report = readTail(reportPath, LOG_READ_MAX_BYTES);
+        const logView: HandoffLogView = {
+          handoffId: record.handoffId,
+          logPath: record.logPath,
+          logTail,
+          reportPath: report !== null ? reportPath : null,
+          report,
+        };
+        log(`log.read: ${record.handoffId} (log ${logTail !== null ? "served" : "absent"}, report ${report !== null ? "served" : "absent"})`);
+        return { ok: true as const, log: logView };
+      } catch (error) {
+        return failure("log-read-failed", messageOf(error));
+      }
+    },
+
     async tailscaleDiscover(_input: {}) {
       try {
         const peers = await discoverTailscalePeers(deps.discoveryRunner ?? execCommandRunner);
@@ -323,6 +386,7 @@ export function registerSurfaceRpc(server: PluginServerContext, handlers: Surfac
   server.handle(handoff, (input) => handlers.handoff(input));
   server.handle(burst, (input) => handlers.burst(input));
   server.handle(gossipSync, (input) => handlers.gossipSync(input));
+  server.handle(logRead, (input) => handlers.logRead(input));
   server.handle(refLand, (input) => handlers.refLand(input));
   server.handle(tailscaleDiscover, (input) => handlers.tailscaleDiscover(input));
 }

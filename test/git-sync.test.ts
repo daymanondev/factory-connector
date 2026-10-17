@@ -1,9 +1,8 @@
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import {
   createCommitBundle,
@@ -21,33 +20,9 @@ import {
   type GossipPeerDigest,
 } from "../src/git-sync.ts";
 import type { FleetNode, FleetPulse } from "../src/fleet.ts";
+import { commitAll, git, initRepo, makeTempDir } from "./helpers.ts";
 
 const execFileAsync = promisify(execFile);
-
-/** Runs real `git` against a fixture checkout (tests may drive git directly). */
-async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", cwd, ...args]);
-  return stdout.toString();
-}
-
-function makeTempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), `factory-connector-${prefix}-`));
-  after(() => rmSync(dir, { recursive: true, force: true }));
-  return dir;
-}
-
-async function initRepo(dir: string, branch = "main"): Promise<string> {
-  await execFileAsync("git", ["init", "-q", "-b", branch, dir]);
-  await execFileAsync("git", ["-C", dir, "config", "user.email", "connector@test.example"]);
-  await execFileAsync("git", ["-C", dir, "config", "user.name", "Connector Test"]);
-  return dir;
-}
-
-async function commitAll(repo: string, message: string): Promise<string> {
-  await execFileAsync("git", ["-C", repo, "add", "-A"]);
-  await execFileAsync("git", ["-C", repo, "commit", "-qm", message]);
-  return (await git(repo, "rev-parse", "HEAD")).trim();
-}
 
 /** Initiating repo: base commit, then two commits on top (the base..HEAD range). */
 async function makeInitiatorWithRange(): Promise<{
@@ -126,6 +101,66 @@ describe("createCommitBundle (base..HEAD + .worktreeinclude packaging)", () => {
       () => createCommitBundle({ repoPath: repo, base: sideHead, outPath: join(outDir, "x.bundle") }),
       /ancestor/,
     );
+  });
+
+  it("packs a compact thin bundle from thinBase when the peer's mirror holds it, falling back to full history otherwise", async () => {
+    const { repo, base, head } = await makeInitiatorWithRange();
+    const middle = (await git(repo, "rev-parse", "HEAD~1")).trim();
+    const outDir = makeTempDir("git-sync-thin");
+
+    const full = await createCommitBundle({ repoPath: repo, base, outPath: join(outDir, "full.bundle") });
+    const thin = await createCommitBundle({
+      repoPath: repo,
+      base,
+      thinBase: middle,
+      outPath: join(outDir, "thin.bundle"),
+    });
+
+    // The thin bundle's base became the mirror's HEAD, and its header records
+    // that commit as a prerequisite (bundle headers are plain text).
+    assert.equal(thin.baseCommit, middle);
+    assert.equal(thin.headCommit, head);
+    const thinHeader = readFileSync(join(outDir, "thin.bundle"), "latin1").slice(0, 2048);
+    assert.ok(thinHeader.includes(`-${middle}`), "prerequisite line recorded");
+    const fullHeader = readFileSync(join(outDir, "full.bundle"), "latin1").slice(0, 2048);
+    assert.ok(!/^-/m.test(fullHeader), "full bundle carries no prerequisites");
+
+    // Thin updates a mirror that holds the prerequisite…
+    const home = makeTempDir("git-sync-thin-home");
+    const mirrorPath = join(home, "connector", "repos", "demo");
+    mkdirSync(dirname(mirrorPath), { recursive: true });
+    await execFileAsync("git", ["clone", "-q", join(outDir, "full.bundle"), mirrorPath]);
+    await execFileAsync("git", ["-C", mirrorPath, "checkout", "-q", middle]);
+    const updated = await ensureMirrorRepoFromBundle({
+      paseoHome: home,
+      canonicalSlug: "demo",
+      bundlePath: join(outDir, "thin.bundle"),
+    });
+    assert.equal(updated.created, false);
+    assert.equal(updated.headCommit, head);
+    assert.equal((await git(mirrorPath, "rev-parse", "HEAD")).trim(), head);
+
+    // …but cannot provision a fresh clone (git refuses missing prerequisites).
+    await assert.rejects(
+      () => execFileAsync("git", ["clone", "-q", join(outDir, "thin.bundle"), join(outDir, "fresh")]),
+      /clone/,
+    );
+
+    // Fallbacks keep the payload self-contained: an unknown thinBase (the peer
+    // holds commits this repo has never seen) and thinBase === HEAD (an empty
+    // range git would refuse to bundle) both degrade to the full history.
+    for (const badThinBase of ["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", head]) {
+      const fallback = await createCommitBundle({
+        repoPath: repo,
+        base,
+        thinBase: badThinBase,
+        outPath: join(outDir, "fallback.bundle"),
+      });
+      assert.equal(fallback.baseCommit, base, `thinBase ${badThinBase.slice(0, 7)} falls back`);
+      const cloneDir = join(outDir, `clone-${badThinBase.slice(0, 7)}`);
+      await execFileAsync("git", ["clone", "-q", join(outDir, "fallback.bundle"), cloneDir]);
+      assert.equal((await git(cloneDir, "rev-parse", "HEAD")).trim(), head);
+    }
   });
 });
 
