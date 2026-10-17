@@ -10,9 +10,11 @@
  * run fully offline against temp directories.
  */
 
+import { execFile } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 /** Physical availability classification of a `Node`. */
 export type NodePosture = "stationary" | "mobile";
@@ -564,4 +566,163 @@ export function selectEligibleNodes(state: FleetState, query: EligibilityQuery):
       if (a.node.freeMemMb !== b.node.freeMemMb) return b.node.freeMemMb - a.node.freeMemMb;
       return a.node.nodeId.localeCompare(b.node.nodeId);
     });
+}
+
+/**
+ * Injectable seam for every shell-out this core performs (SSH, `tailscale`).
+ * The plugin server layer can adapt this to the SDK's `execCommand`; tests pass
+ * a stub so nothing here ever touches the network.
+ */
+export interface CommandRunner {
+  run(
+    command: string,
+    args: string[],
+    options?: { timeoutMs?: number },
+  ): Promise<{ stdout: string; stderr: string }>;
+}
+
+const execFileAsync = promisify(execFile);
+
+/** Production `CommandRunner` backed by `node:child_process.execFile`. */
+export const execCommandRunner: CommandRunner = {
+  async run(command, args, options) {
+    const { stdout, stderr } = await execFileAsync(command, args, {
+      timeout: options?.timeoutMs,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return { stdout, stderr };
+  },
+};
+
+/** The pieces of an `ssh://user@host?daemonPort=6767` target the transport needs. */
+export interface SshTargetParts {
+  user: string | undefined;
+  host: string;
+  daemonPort: number | undefined;
+}
+
+export function parseSshTarget(sshTarget: string): SshTargetParts {
+  let url: URL;
+  try {
+    url = new URL(sshTarget);
+  } catch {
+    throw new Error(`factory-connector: malformed sshTarget ${JSON.stringify(sshTarget)}`);
+  }
+  if (url.protocol !== "ssh:") {
+    throw new Error(
+      `factory-connector: sshTarget must use the ssh:// scheme, got ${JSON.stringify(sshTarget)}`,
+    );
+  }
+  if (!url.hostname) {
+    throw new Error(`factory-connector: sshTarget is missing a host: ${JSON.stringify(sshTarget)}`);
+  }
+  const daemonPortParam = url.searchParams.get("daemonPort");
+  const daemonPort = daemonPortParam === null ? undefined : Number(daemonPortParam);
+  if (daemonPort !== undefined && (!Number.isInteger(daemonPort) || daemonPort <= 0)) {
+    throw new Error(
+      `factory-connector: sshTarget has an invalid daemonPort: ${JSON.stringify(sshTarget)}`,
+    );
+  }
+  return { user: url.username || undefined, host: url.hostname, daemonPort };
+}
+
+/**
+ * Production `PulseTransport`: reads the peer's own digest out of its
+ * `<paseoHome>/connector/fleet-state.json` over Tailscale SSH in BatchMode.
+ * Digest-first — one small file read per poll, never token/log streaming.
+ */
+export function createSshPulseTransport(options?: {
+  runner?: CommandRunner;
+  connectTimeoutSeconds?: number;
+}): PulseTransport {
+  const runner = options?.runner ?? execCommandRunner;
+  const connectTimeout = options?.connectTimeoutSeconds ?? 5;
+  return {
+    async fetchPulse(node) {
+      if (!node.sshTarget) {
+        throw new Error(`factory-connector: Node ${node.id} has no sshTarget to poll`);
+      }
+      const { user, host } = parseSshTarget(node.sshTarget);
+      const destination = user ? `${user}@${host}` : host;
+      const remoteHome = node.remotePaseoHome ?? DEFAULT_REMOTE_PASEO_HOME;
+      const remoteCommand = `cat ${remoteHome}/connector/${FLEET_STATE_FILENAME}`;
+      const { stdout } = await runner.run(
+        "ssh",
+        ["-o", "BatchMode=yes", "-o", `ConnectTimeout=${connectTimeout}`, destination, remoteCommand],
+        { timeoutMs: PULSE_FETCH_TIMEOUT_MS },
+      );
+      let peerState: FleetState;
+      try {
+        peerState = JSON.parse(stdout) as FleetState;
+      } catch (error) {
+        throw new Error(
+          `factory-connector: Node ${node.id} returned an unparsable fleet-state: ${(error as Error).message}`,
+        );
+      }
+      const own = peerState.nodes?.find((entry) => entry.nodeId === peerState.localNodeId);
+      if (!own) {
+        throw new Error(
+          `factory-connector: Node ${node.id} fleet-state carries no entry for its local Node`,
+        );
+      }
+      return {
+        nodeId: own.nodeId,
+        online: own.online,
+        cpuPercent: own.cpuPercent,
+        freeMemMb: own.freeMemMb,
+        activeAgents: own.activeAgents,
+        activeBurnRuns: own.activeBurnRuns,
+        meterSummary: own.meterSummary ?? null,
+        freePoolUpdatedAt: own.freePoolUpdatedAt ?? null,
+        runsUpdatedAt: own.runsUpdatedAt ?? null,
+        collectedAt: own.collectedAt,
+      };
+    },
+  };
+}
+
+/** A Tailscale peer as reported by `tailscale status --json`, distilled for registration. */
+export interface TailscalePeer {
+  /** Slug derived from the hostname — usable as a `FleetNode` id candidate. */
+  id: string;
+  name: string;
+  dnsName: string;
+  tailscaleIp: string;
+  online: boolean;
+  os: string;
+}
+
+/** Parses `tailscale status --json` stdout into `TailscalePeer` descriptors. */
+export function parseTailscalePeers(statusJson: string): TailscalePeer[] {
+  let parsed: { Peer?: Record<string, Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(statusJson) as { Peer?: Record<string, Record<string, unknown>> };
+  } catch (error) {
+    throw new Error(
+      `factory-connector: unparsable tailscale status output: ${(error as Error).message}`,
+    );
+  }
+  const peers: TailscalePeer[] = [];
+  for (const peer of Object.values(parsed.Peer ?? {})) {
+    const hostName = typeof peer.HostName === "string" ? peer.HostName : "";
+    const ips = Array.isArray(peer.TailscaleIPs) ? peer.TailscaleIPs : [];
+    const ip = typeof ips[0] === "string" ? ips[0] : "";
+    if (!hostName || !ip) continue;
+    const dnsName = typeof peer.DNSName === "string" ? peer.DNSName.replace(/\.$/, "") : "";
+    peers.push({
+      id: slugifyHostName(hostName),
+      name: hostName,
+      dnsName,
+      tailscaleIp: ip,
+      online: peer.Online === true,
+      os: typeof peer.OS === "string" ? peer.OS : "unknown",
+    });
+  }
+  return peers.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Discovers Tailscale peers for the `Node` registration helper (ADR 0001 §3). */
+export async function discoverTailscalePeers(runner: CommandRunner = execCommandRunner): Promise<TailscalePeer[]> {
+  const { stdout } = await runner.run("tailscale", ["status", "--json"]);
+  return parseTailscalePeers(stdout);
 }

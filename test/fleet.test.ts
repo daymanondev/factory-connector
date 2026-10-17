@@ -21,10 +21,15 @@ import {
   loadFleetState,
   fleetStatePath,
   selectEligibleNodes,
+  parseSshTarget,
+  createSshPulseTransport,
+  parseTailscalePeers,
+  discoverTailscalePeers,
   type FleetState,
   type FleetNodeState,
   type FleetPulse,
   type PulseTransport,
+  type CommandRunner,
 } from "../src/fleet.ts";
 
 function makePulse(overrides: Partial<FleetPulse> & { nodeId: string }): FleetPulse {
@@ -485,5 +490,150 @@ describe("candidate selection (selectEligibleNodes)", () => {
     ]);
     const eligible = selectEligibleNodes(state, { purpose: "burst" });
     assert.equal(eligible.length, 1);
+  });
+});
+
+describe("SSH pulse transport (createSshPulseTransport)", () => {
+  it("parses ssh:// targets into user, host, and daemonPort", () => {
+    assert.deepEqual(parseSshTarget("ssh://andrew@100.101.102.103?daemonPort=6767"), {
+      user: "andrew",
+      host: "100.101.102.103",
+      daemonPort: 6767,
+    });
+    assert.deepEqual(parseSshTarget("ssh://100.101.102.103"), {
+      user: undefined,
+      host: "100.101.102.103",
+      daemonPort: undefined,
+    });
+    assert.throws(() => parseSshTarget("http://not-ssh.example"), /ssh/);
+  });
+
+  it("fetches the peer's own digest from its fleet-state.json over BatchMode SSH via the injected runner", async () => {
+    const peerState = {
+      version: 1,
+      localNodeId: "mac-studio",
+      updatedAt: "2026-10-17T10:00:00.000Z",
+      nodes: [
+        makePulse({ nodeId: "mac-studio", cpuPercent: 42, freeMemMb: 1024, activeBurnRuns: 2 }),
+        makePulse({ nodeId: "other", cpuPercent: 1 }),
+      ].map((pulse) => ({
+        ...pulse,
+        name: pulse.nodeId,
+        posture: "stationary",
+        slotCeiling: 2,
+        reserveMode: false,
+        healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 },
+        slotsInUse: 0,
+        lastError: null,
+      })),
+    };
+
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: CommandRunner = {
+      run: async (command, args) => {
+        calls.push({ command, args });
+        return { stdout: JSON.stringify(peerState), stderr: "" };
+      },
+    };
+
+    const transport = createSshPulseTransport({ runner });
+    const pulse = await transport.fetchPulse({
+      id: "mac-studio",
+      name: "Mac Studio",
+      posture: "stationary",
+      transport: "ssh",
+      sshTarget: "ssh://andrew@100.101.102.103?daemonPort=6767",
+      remotePaseoHome: "/home/andrew/.paseo-factory",
+      slotCeiling: 2,
+      reserveMode: false,
+      healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 },
+    });
+
+    assert.equal(pulse.nodeId, "mac-studio");
+    assert.equal(pulse.cpuPercent, 42);
+    assert.equal(pulse.activeBurnRuns, 2);
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, "ssh");
+    const args = calls[0].args;
+    assert.ok(args.includes("BatchMode=yes"));
+    assert.ok(args.includes("ConnectTimeout=5"));
+    assert.ok(args.includes("andrew@100.101.102.103"));
+    const remote = args[args.length - 1];
+    assert.equal(remote, "cat /home/andrew/.paseo-factory/connector/fleet-state.json");
+  });
+
+  it("propagates runner failures so pollFleetPulse records the Node offline", async () => {
+    const runner: CommandRunner = {
+      run: async () => {
+        throw new Error("ssh: connect to host refused");
+      },
+    };
+    const transport = createSshPulseTransport({ runner });
+    await assert.rejects(
+      () =>
+        transport.fetchPulse({
+          id: "mac-studio",
+          name: "Mac Studio",
+          posture: "stationary",
+          transport: "ssh",
+          sshTarget: "ssh://100.101.102.103",
+          slotCeiling: 2,
+          reserveMode: false,
+          healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 },
+        }),
+      /refused/,
+    );
+  });
+});
+
+describe("Tailscale peer discovery", () => {
+  const tailscaleStatusJson = JSON.stringify({
+    Peer: {
+      "nodekey:aaaa": {
+        DNSName: "mac-studio.tailnet.ts.net.",
+        HostName: "Mac-Studio",
+        TailscaleIPs: ["100.101.102.103", "fd7a:115c:a1e0::1"],
+        Online: true,
+        OS: "macOS",
+      },
+      "nodekey:bbbb": {
+        DNSName: "win-wsl.tailnet.ts.net.",
+        HostName: "DESKTOP-WIN",
+        TailscaleIPs: ["100.101.102.104"],
+        Online: false,
+        OS: "linux",
+      },
+    },
+  });
+
+  it("parses `tailscale status --json` output into peer descriptors", () => {
+    const peers = parseTailscalePeers(tailscaleStatusJson);
+    assert.equal(peers.length, 2);
+
+    const studio = peers.find((peer) => peer.tailscaleIp === "100.101.102.103");
+    assert.ok(studio);
+    assert.equal(studio.name, "Mac-Studio");
+    assert.equal(studio.dnsName, "mac-studio.tailnet.ts.net");
+    assert.equal(studio.online, true);
+    assert.equal(studio.os, "macOS");
+
+    const win = peers.find((peer) => peer.tailscaleIp === "100.101.102.104");
+    assert.ok(win);
+    assert.equal(win.online, false);
+  });
+
+  it("discovers peers through the injected CommandRunner (no real binary, no network)", async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: CommandRunner = {
+      run: async (command, args) => {
+        calls.push({ command, args });
+        return { stdout: tailscaleStatusJson, stderr: "" };
+      },
+    };
+
+    const peers = await discoverTailscalePeers(runner);
+    assert.deepEqual(calls, [{ command: "tailscale", args: ["status", "--json"] }]);
+    assert.equal(peers.length, 2);
   });
 });
