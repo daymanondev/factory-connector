@@ -30,6 +30,7 @@ import {
 import {
   receiveHandoff,
   dispatchHandoff,
+  executeBurst,
   loadHandoff,
   handoffRecordPath,
   type DetachedSpawn,
@@ -597,5 +598,211 @@ describe("dispatchHandoff (initiating Node side)", () => {
     assert.equal(landed.branch, "fleet/studio-a/run-42");
     assert.equal((await git(repo, "rev-parse", "HEAD")).trim(), completedHead);
     assert.equal(readFileSync(join(repo, "playbook.txt"), "utf8"), "done\n");
+  });
+});
+
+describe("executeBurst (cooperative parallel execution)", () => {
+  const burstStartedAt = new Date("2026-10-17T11:00:00.000Z");
+
+  /** Registry + snapshot: laptop (local) + two stationary peers + ineligible peers. */
+  function seededBurstFleet(): { initiatorHome: string; state: FleetState } {
+    const initiatorHome = makeTempHome("burst-initiator");
+    seedRegistry(initiatorHome, [
+      fleetNode({ id: "studio-a", name: "Studio A", posture: "stationary", slotCeiling: 2 }),
+      fleetNode({ id: "studio-b", name: "Studio B", posture: "stationary", slotCeiling: 1 }),
+      fleetNode({ id: "reserved", name: "Reserved Box", posture: "stationary" }),
+      fleetNode({ id: "hot", name: "Hot Box", posture: "stationary" }),
+    ]);
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", name: "Laptop", posture: "mobile", slotCeiling: 2, slotsInUse: 2 }),
+      nodeState({ nodeId: "studio-a", name: "Studio A", posture: "stationary", slotCeiling: 2 }),
+      nodeState({ nodeId: "studio-b", name: "Studio B", posture: "stationary", slotCeiling: 1 }),
+      nodeState({ nodeId: "reserved", name: "Reserved Box", posture: "stationary", reserveMode: true }),
+      nodeState({ nodeId: "hot", name: "Hot Box", posture: "stationary", cpuPercent: 99 }),
+    ]);
+    return { initiatorHome, state };
+  }
+
+  interface NodeRecording {
+    attempts: number;
+    maxConcurrent: number;
+    observedSlots: number[];
+    commands: string[];
+  }
+
+  /**
+   * Deterministic peer stub: records concurrency and the `slotsInUse` it
+   * observes in `fleet-state.json` at attempt start; `behaviour(nodeId)`
+   * decides success (after `delayMs`) or a thrown disconnect.
+   */
+  function recordingPeers(
+    initiatorHome: string,
+    behaviour: (nodeId: string, attempt: number) => { ok: true; delayMs: number } | { ok: false; error: string; delayMs: number },
+    delayMs = 25,
+  ): { runner: RemoteCommandRunner; recording: Map<string, NodeRecording> } {
+    const recording = new Map<string, NodeRecording>();
+    const inFlight = new Map<string, number>();
+    const track = (nodeId: string): NodeRecording => {
+      let entry = recording.get(nodeId);
+      if (!entry) {
+        entry = { attempts: 0, maxConcurrent: 0, observedSlots: [], commands: [] };
+        recording.set(nodeId, entry);
+      }
+      return entry;
+    };
+    return {
+      recording,
+      runner: {
+        async run(node, command) {
+          const entry = track(node.id);
+          const state = loadFleetState(initiatorHome);
+          entry.observedSlots.push(
+            state?.nodes.find((candidate) => candidate.nodeId === node.id)?.slotsInUse ?? -1,
+          );
+          entry.attempts += 1;
+          entry.commands.push(command);
+          const running = (inFlight.get(node.id) ?? 0) + 1;
+          inFlight.set(node.id, running);
+          entry.maxConcurrent = Math.max(entry.maxConcurrent, running);
+          const outcome = behaviour(node.id, entry.attempts);
+          await new Promise((resolve) => setTimeout(resolve, outcome.delayMs || delayMs));
+          inFlight.set(node.id, (inFlight.get(node.id) ?? 0) - 1);
+          if (!outcome.ok) throw new Error(outcome.error);
+          return { stdout: `done:${node.id}:${entry.attempts}`, stderr: "" };
+        },
+      },
+    };
+  }
+
+  it("distributes units across eligible Nodes respecting Slot ceilings, Health guard, and Reserve mode", async () => {
+    const { initiatorHome, state } = seededBurstFleet();
+    const { runner, recording } = recordingPeers(initiatorHome, () => ({ ok: true, delayMs: 25 }));
+
+    const report = await executeBurst({
+      paseoHome: initiatorHome,
+      state,
+      units: [
+        { id: "probe-1", command: "scout --model a" },
+        { id: "probe-2", command: "scout --model b" },
+        { id: "probe-3", command: "scout --model c" },
+      ],
+      remoteRunner: runner,
+      now: () => burstStartedAt,
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(report.results.length, 3);
+    for (const result of report.results) {
+      assert.equal(result.ok, true, `unit ${result.unitId} should have succeeded`);
+      assert.equal(result.attempts.length, 1);
+      assert.ok(result.nodeId === "studio-a" || result.nodeId === "studio-b");
+      assert.equal(result.attempts[0].ok, true);
+      assert.ok(result.attempts[0].stdout.startsWith("done:"));
+      assert.ok(Date.parse(result.attempts[0].startedAt) <= Date.parse(result.attempts[0].endedAt));
+    }
+    // Capacity-respecting assignment: studio-a (2 free slots) took two units,
+    // studio-b (1 free slot) took one; ineligible Nodes took none.
+    const assignedTo = (nodeId: string): number =>
+      report.results.filter((result) => result.nodeId === nodeId).length;
+    assert.equal(assignedTo("studio-a"), 2);
+    assert.equal(assignedTo("studio-b"), 1);
+    assert.equal(recording.get("reserved"), undefined);
+    assert.equal(recording.get("hot"), undefined);
+    assert.equal(recording.get("laptop"), undefined);
+    // Never more in flight on a Node than its Slot ceiling.
+    assert.ok(recording.get("studio-a")!.maxConcurrent <= 2);
+    assert.ok(recording.get("studio-b")!.maxConcurrent <= 1);
+
+    // In-flight accounting: peers observed their assigned slots while running,
+    // and everything the burst took is released once it settles (the saturated
+    // laptop keeps its pre-existing occupancy — the burst never owned it).
+    assert.equal(Math.max(...recording.get("studio-a")!.observedSlots), 2);
+    assert.equal(Math.max(...recording.get("studio-b")!.observedSlots), 1);
+    const settled = loadFleetState(initiatorHome);
+    assert.ok(settled);
+    for (const node of settled.nodes) {
+      if (node.nodeId === "laptop") {
+        assert.equal(node.slotsInUse, 2);
+        continue;
+      }
+      assert.equal(node.slotsInUse, 0, `node ${node.nodeId} should have released its slots`);
+    }
+  });
+
+  it("runs units for the local Node through the local runner, not the remote seam", async () => {
+    const initiatorHome = makeTempHome("burst-local");
+    seedRegistry(initiatorHome, [
+      fleetNode({ id: "studio-a", name: "Studio A", posture: "stationary", slotCeiling: 1 }),
+    ]);
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", name: "Laptop", posture: "mobile", slotCeiling: 3 }),
+      nodeState({ nodeId: "studio-a", name: "Studio A", posture: "stationary", slotCeiling: 1 }),
+    ]);
+
+    const localCalls: Array<{ command: string; args: string[] }> = [];
+    const report = await executeBurst({
+      paseoHome: initiatorHome,
+      state,
+      units: [{ id: "probe-1", command: "echo local" }],
+      localRunner: {
+        run: async (command, args) => {
+          localCalls.push({ command, args });
+          return { stdout: "local-ok", stderr: "" };
+        },
+      },
+      remoteRunner: {
+        async run() {
+          throw new Error("remote seam must not be used for the local Node");
+        },
+      },
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(report.results[0].nodeId, "laptop");
+    assert.equal(report.results[0].attempts[0].stdout, "local-ok");
+    assert.deepEqual(localCalls, [{ command: "sh", args: ["-c", "echo local"] }]);
+  });
+
+  it("refuses to burst when no Node is eligible", async () => {
+    const initiatorHome = makeTempHome("burst-empty");
+    seedRegistry(initiatorHome, [fleetNode({ id: "studio-a", name: "Studio A" })]);
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", posture: "mobile", reserveMode: true }),
+      nodeState({ nodeId: "studio-a", reserveMode: true }),
+    ]);
+    await assert.rejects(
+      () =>
+        executeBurst({
+          paseoHome: initiatorHome,
+          state,
+          units: [{ id: "probe-1", command: "echo hi" }],
+        }),
+      /no eligible/i,
+    );
+  });
+
+  it("rejects units with duplicate or empty ids instead of dispatching garbage", async () => {
+    const { initiatorHome, state } = seededBurstFleet();
+    await assert.rejects(
+      () =>
+        executeBurst({
+          paseoHome: initiatorHome,
+          state,
+          units: [
+            { id: "probe-1", command: "echo a" },
+            { id: "probe-1", command: "echo b" },
+          ],
+        }),
+      /probe-1/,
+    );
+    await assert.rejects(
+      () =>
+        executeBurst({
+          paseoHome: initiatorHome,
+          state,
+          units: [{ id: "", command: "echo a" }],
+        }),
+      /non-empty id/,
+    );
   });
 });

@@ -28,6 +28,7 @@ import {
   saveFleetState,
   selectEligibleNodes,
   type CommandRunner,
+  type EligibleNode,
   type FleetNode,
   type FleetNodeState,
   type FleetState,
@@ -566,4 +567,247 @@ export async function dispatchHandoff(options: {
     ),
   });
   return record;
+}
+
+/**
+ * `Burst` — cooperative parallel execution. One unit of stateless work (a
+ * `Scout pool` / `OSS lab` / `Council` probe or one isolated worktree + `Gate`
+ * attempt) that can safely be attempted more than once.
+ */
+export interface BurstWorkUnit {
+  id: string;
+  /** Shell command for the unit; it carries its own working context. */
+  command: string;
+}
+
+/** One execution of one unit on one `Node` (failover appends more attempts). */
+export interface BurstAttempt {
+  nodeId: string;
+  startedAt: string;
+  endedAt: string;
+  ok: boolean;
+  error: string | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Final outcome of one unit: every attempt in order plus where it settled. */
+export interface BurstUnitResult {
+  unitId: string;
+  command: string;
+  attempts: BurstAttempt[];
+  ok: boolean;
+  /** `Node` that finally ran the unit (null when every attempt failed). */
+  nodeId: string | null;
+}
+
+/** What a whole `Burst` settled to. */
+export interface BurstReport {
+  ok: boolean;
+  startedAt: string;
+  finishedAt: string;
+  results: BurstUnitResult[];
+}
+
+/** Default ceiling for a single work-unit attempt before failover kicks in. */
+export const BURST_ATTEMPT_TIMEOUT_MS = 300_000;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Distributes a batch of parallel work units across the eligible online
+ * `Node`s of the `Fleet` (`selectEligibleNodes` already applied `Slot
+ * ceiling`, `Health guard`, and `Reserve mode` filtering), scheduling greedily
+ * onto the roomiest surviving candidate and never exceeding a `Node`'s free
+ * slots. Any attempt that fails — a peer disconnecting or timing out
+ * mid-attempt included — is transparently retried on a surviving `Node` (each
+ * `Node` is tried at most once per unit). In-flight occupancy is recorded as
+ * `slotsInUse` in `fleet-state.json` for the whole `Fleet` to see, and
+ * released as attempts settle.
+ */
+export async function executeBurst(options: {
+  paseoHome: string;
+  state: FleetState;
+  units: BurstWorkUnit[];
+  localRunner?: CommandRunner;
+  remoteRunner?: RemoteCommandRunner;
+  attemptTimeoutMs?: number;
+  now?: () => Date;
+}): Promise<BurstReport> {
+  const now = options.now ?? (() => new Date());
+  const startedAt = now().toISOString();
+
+  const seen = new Set<string>();
+  for (const unit of options.units) {
+    if (typeof unit?.id !== "string" || unit.id.trim() === "") {
+      throw new Error("factory-connector: every Burst work unit needs a non-empty id");
+    }
+    if (seen.has(unit.id)) {
+      throw new Error(`factory-connector: duplicate Burst work unit id ${JSON.stringify(unit.id)}`);
+    }
+    seen.add(unit.id);
+    if (typeof unit.command !== "string" || unit.command.trim() === "") {
+      throw new Error(`factory-connector: Burst work unit ${unit.id} needs a command`);
+    }
+  }
+
+  const eligible = selectEligibleNodes(options.state, { purpose: "burst" });
+  if (eligible.length === 0) {
+    throw new Error(
+      "factory-connector: Burst found no eligible online Node (all offline, in Reserve mode, " +
+        "outside Health guard thresholds, or slot-saturated)",
+    );
+  }
+
+  const registry = new Map(loadFleetConfig(options.paseoHome).nodes.map((node) => [node.id, node]));
+  const localRunner = options.localRunner ?? execCommandRunner;
+  const remoteRunner = options.remoteRunner ?? createSshRemoteCommandRunner();
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? BURST_ATTEMPT_TIMEOUT_MS;
+
+  const remaining = new Map<string, number>(eligible.map((entry) => [entry.node.nodeId, entry.freeSlots]));
+  const inFlight = new Map<string, number>(eligible.map((entry) => [entry.node.nodeId, 0]));
+  // Slot bookkeeping is written into a private copy of the snapshot so peers
+  // polling fleet-state.json observe live occupancy.
+  const slotsState: FleetState = {
+    ...options.state,
+    nodes: options.state.nodes.map((node) => ({ ...node })),
+  };
+  function persistSlots(): void {
+    for (const node of slotsState.nodes) {
+      const value = inFlight.get(node.nodeId);
+      if (value !== undefined) node.slotsInUse = value;
+    }
+    saveFleetState(options.paseoHome, slotsState);
+  }
+
+  interface QueueEntry {
+    result: BurstUnitResult;
+    excluded: Set<string>;
+  }
+  const entries: QueueEntry[] = options.units.map((unit) => ({
+    result: { unitId: unit.id, command: unit.command, attempts: [], ok: false, nodeId: null },
+    excluded: new Set<string>(),
+  }));
+  const queue: QueueEntry[] = [...entries];
+  const running = new Set<Promise<void>>();
+
+  /** Roomiest non-excluded candidate with free capacity (ties keep fleet rank). */
+  function pickNode(entry: QueueEntry): EligibleNode | null {
+    let best: EligibleNode | null = null;
+    let bestCapacity = 0;
+    for (const candidate of eligible) {
+      if (entry.excluded.has(candidate.node.nodeId)) continue;
+      const capacity = remaining.get(candidate.node.nodeId) ?? 0;
+      if (capacity > bestCapacity) {
+        best = candidate;
+        bestCapacity = capacity;
+      }
+    }
+    return best;
+  }
+
+  async function runAttempt(entry: QueueEntry, choice: EligibleNode): Promise<void> {
+    const nodeId = choice.node.nodeId;
+    remaining.set(nodeId, (remaining.get(nodeId) ?? 0) - 1);
+    inFlight.set(nodeId, (inFlight.get(nodeId) ?? 0) + 1);
+    persistSlots();
+
+    const attempt: BurstAttempt = {
+      nodeId,
+      startedAt: now().toISOString(),
+      endedAt: "",
+      ok: false,
+      error: null,
+      stdout: "",
+      stderr: "",
+    };
+    try {
+      const node = registry.get(nodeId);
+      if (!node) {
+        throw new Error(`factory-connector: Node ${nodeId} is not in the fleet registry at this home`);
+      }
+      const outcome =
+        node.transport === "local"
+          ? await withTimeout(
+              localRunner.run("sh", ["-c", entry.result.command], { timeoutMs: attemptTimeoutMs }),
+              attemptTimeoutMs,
+              `factory-connector: Burst unit ${entry.result.unitId} on ${nodeId}`,
+            )
+          : await withTimeout(
+              remoteRunner.run(node, `sh -c ${shellQuote(entry.result.command)}`, {
+                timeoutMs: attemptTimeoutMs,
+              }),
+              attemptTimeoutMs,
+              `factory-connector: Burst unit ${entry.result.unitId} on ${nodeId}`,
+            );
+      attempt.stdout = outcome.stdout;
+      attempt.stderr = outcome.stderr;
+      attempt.ok = true;
+      entry.result.ok = true;
+      entry.result.nodeId = nodeId;
+    } catch (error) {
+      attempt.ok = false;
+      attempt.error = (error as Error).message;
+    } finally {
+      attempt.endedAt = now().toISOString();
+      entry.result.attempts.push(attempt);
+      remaining.set(nodeId, (remaining.get(nodeId) ?? 0) + 1);
+      inFlight.set(nodeId, (inFlight.get(nodeId) ?? 0) - 1);
+      persistSlots();
+    }
+    if (!attempt.ok) {
+      // The attempt failed on this Node — a disconnected peer is the common
+      // cause. Retry the unit on a surviving Node (each Node at most once).
+      entry.excluded.add(nodeId);
+      if (entry.excluded.size < eligible.length) {
+        queue.unshift(entry);
+      }
+    }
+  }
+
+  function schedule(): void {
+    for (let i = 0; i < queue.length; ) {
+      const entry = queue[i];
+      const choice = pickNode(entry);
+      if (!choice) {
+        i += 1;
+        continue;
+      }
+      queue.splice(i, 1);
+      const completion = runAttempt(entry, choice).then(() => {
+        running.delete(completion);
+        schedule();
+      });
+      running.add(completion);
+    }
+  }
+
+  schedule();
+  while (running.size > 0) {
+    await Promise.all([...running]);
+  }
+
+  return {
+    ok: entries.every((entry) => entry.result.ok),
+    startedAt,
+    finishedAt: now().toISOString(),
+    results: entries.map((entry) => entry.result),
+  };
 }
