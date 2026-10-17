@@ -602,3 +602,51 @@ describe("connector.burst", () => {
     assert.match(reply.error, /no eligible online Node/);
   });
 });
+
+describe("connector.gossip.sync", () => {
+  it("pulls strictly newer peer artifacts last-write-wins through the injected transports", async () => {
+    const home = makeTempHome("gossip");
+    seedRegistry(home, [fleetNode({ id: "studio-a" })]);
+    const pulseTransport = stubTransport({
+      "studio-a": {
+        freePoolUpdatedAt: "2026-10-17T11:00:00.000Z",
+        runsUpdatedAt: "2026-10-17T11:00:00.000Z",
+      },
+    }).transport;
+    const gossipFiles = new Map<string, string>([
+      ["burn-lab/free-pool.json", '{"updatedAt":"2026-10-17T11:00:00.000Z","best":"glm"}\n'],
+      ["burn-lab/runs/run-9.json", '{"id":"run-9","updatedAt":"2026-10-17T11:00:00.000Z"}\n'],
+      ["burn-lab/runs/run-9/report.md", "# run-9 report\n"],
+    ]);
+    const gossipReads: string[] = [];
+    const gossipTransport = {
+      async readFile(node, relativePath) {
+        gossipReads.push(`${node.id}:${relativePath}`);
+        return gossipFiles.get(relativePath) ?? null;
+      },
+      async listFiles(node, relativeDir) {
+        gossipReads.push(`${node.id}:list:${relativeDir}`);
+        return relativeDir === "burn-lab/runs" ? ["run-9.json"] : [];
+      },
+    };
+    const handlers = makeHandlers(home, { transport: pulseTransport, gossipTransport });
+
+    const reply = await handlers.gossipSync({});
+
+    assert.equal(reply.ok, true, reply.ok ? "" : reply.error);
+    if (!reply.ok) return;
+    assert.deepEqual(reply.report.freePool, [{ nodeId: "studio-a", updatedAt: "2026-10-17T11:00:00.000Z" }]);
+    assert.deepEqual(reply.report.runs, [{ nodeId: "studio-a", runId: "run-9", updatedAt: "2026-10-17T11:00:00.000Z" }]);
+    assert.equal(
+      readFileSync(join(home, "burn-lab", "free-pool.json"), "utf8"),
+      gossipFiles.get("burn-lab/free-pool.json"),
+    );
+    assert.ok(existsSync(join(home, "burn-lab", "runs", "run-9", "report.md")));
+
+    // LWW settles: a second pass against the same stamps pulls nothing new.
+    const again = await handlers.gossipSync({});
+    assert.ok(again.ok);
+    if (!again.ok) return;
+    assert.deepEqual(again.report, { freePool: [], runs: [] });
+  });
+});

@@ -134,3 +134,23 @@ export const BurstReportViewSchema = z.object({
   results: z.array(BurstUnitResultViewSchema),
 });
 export type BurstReportView = z.infer<typeof BurstReportViewSchema>;
+
+/** One `free-pool.json` pulled from a peer because its stamp was newer. */
+export const GossipFreePoolPullSchema = z.object({
+  nodeId: z.string(),
+  updatedAt: z.string(),
+});
+
+/** One completed `BurnRunRecord` (and its artifacts) pulled from a peer. */
+export const GossipRunPullSchema = z.object({
+  nodeId: z.string(),
+  runId: z.string(),
+  updatedAt: z.string(),
+});
+
+/** What a `Gossip sync` pass actually reconciled. */
+export const GossipSyncReportViewSchema = z.object({
+  freePool: z.array(GossipFreePoolPullSchema),
+  runs: z.array(GossipRunPullSchema),
+});
+export type GossipSyncReportView = z.infer<typeof GossipSyncReportViewSchema>;

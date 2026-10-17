@@ -23,7 +23,7 @@ import {
   type LocalPulseSource,
   type PulseTransport,
 } from "./core/fleet.ts";
-import type { GossipArtifactTransport } from "./core/git-sync.ts";
+import { createSshGossipTransport, reconcileGossipSync, type GossipArtifactTransport } from "./core/git-sync.ts";
 import {
   dispatchHandoff,
   executeBurst,
@@ -32,8 +32,8 @@ import {
   type RemoteCommandRunner,
 } from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { burst, handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
-import type { BurstReportView, FleetNodeInputView, FleetView, HandoffRecordView } from "../shared/view.ts";
+import { burst, gossipSync, handoff, nodeRemove, nodeReserve, nodeUpsert, pulse, snapshot } from "../shared/rpc.ts";
+import type { BurstReportView, FleetNodeInputView, FleetView, GossipSyncReportView, HandoffRecordView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
 export interface SurfaceCallContext {
@@ -238,6 +238,38 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         return failure("burst-failed", messageOf(error));
       }
     },
+
+    async gossipSync(_input: {}) {
+      try {
+        // "Now" means now: a fresh poll collects the peers' current stamps to
+        // order the reconciliation against (a stale snapshot would miss runs a
+        // peer finished since the last cadence tick).
+        const state = await pollFleetPulse({
+          paseoHome: deps.paseoHome,
+          transport: deps.transport,
+          localSource: deps.localSource ?? defaultLocalPulseSource(),
+          now: deps.now,
+        });
+        const registry = new Map(loadFleetConfig(deps.paseoHome).nodes.map((node) => [node.id, node]));
+        const peers = state.nodes
+          .filter((entry) => entry.nodeId !== state.localNodeId && entry.online)
+          .flatMap((entry) => {
+            const node = registry.get(entry.nodeId);
+            return node === undefined ? [] : [{ node, pulse: entry }];
+          });
+        const report = await reconcileGossipSync({
+          paseoHome: deps.paseoHome,
+          peers,
+          transport: deps.gossipTransport ?? createSshGossipTransport(),
+        });
+        log(
+          `gossip.sync: pulled ${report.freePool.length} free-pool update(s), ${report.runs.length} run record(s)`,
+        );
+        return { ok: true as const, report: report as GossipSyncReportView };
+      } catch (error) {
+        return failure("gossip-failed", messageOf(error));
+      }
+    },
   };
 }
 
@@ -256,4 +288,5 @@ export function registerSurfaceRpc(server: PluginServerContext, handlers: Surfac
   server.handle(pulse, (input) => handlers.pulse(input));
   server.handle(handoff, (input) => handlers.handoff(input));
   server.handle(burst, (input) => handlers.burst(input));
+  server.handle(gossipSync, (input) => handlers.gossipSync(input));
 }
