@@ -456,6 +456,15 @@ export function loadFleetState(paseoHome: string): FleetState | null {
 }
 
 /**
+ * Atomically writes the `Fleet pulse` snapshot. Dispatch uses this to record
+ * `slotsInUse` bookkeeping in place; the next `pollFleetPulse` carries the
+ * values over.
+ */
+export function saveFleetState(paseoHome: string, state: FleetState): void {
+  writeJsonAtomic(fleetStatePath(paseoHome), state);
+}
+
+/**
  * Collects the local `Fleet pulse`, fetches every peer `Node`'s digest through
  * the injectable `PulseTransport` (a failing or timed-out peer is recorded as
  * offline instead of failing the poll), and writes the merged snapshot to

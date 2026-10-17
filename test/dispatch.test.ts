@@ -18,13 +18,24 @@ import {
   stageFleetRefFromBundle,
   landFleetRef,
 } from "../src/git-sync.ts";
-import type { FleetState, FleetNodeState } from "../src/fleet.ts";
+import {
+  DEFAULT_HEALTH_GUARD,
+  saveFleetConfig,
+  loadFleetState,
+  fleetStatePath,
+  type FleetState,
+  type FleetNode,
+  type FleetNodeState,
+} from "../src/fleet.ts";
 import {
   receiveHandoff,
+  dispatchHandoff,
   loadHandoff,
   handoffRecordPath,
   type DetachedSpawn,
   type HandoffRecord,
+  type GitBundleTransport,
+  type RemoteCommandRunner,
 } from "../src/dispatch.ts";
 
 const execFileAsync = promisify(execFile);
@@ -87,6 +98,95 @@ function recordingSpawn(): { spawns: Array<{ cwd: string; command: string; logPa
       async spawn(options) {
         spawns.push(options);
         return { pid: "31337" };
+      },
+    },
+  };
+}
+
+function fleetNode(overrides: Partial<FleetNode> & { id: string }): FleetNode {
+  return {
+    name: overrides.id,
+    posture: "stationary",
+    transport: "ssh",
+    sshTarget: `ssh://andrew@100.101.102.${100 + overrides.id.length}?daemonPort=6767`,
+    remotePaseoHome: "~/.paseo-factory",
+    slotCeiling: 2,
+    reserveMode: false,
+    healthGuard: { ...DEFAULT_HEALTH_GUARD },
+    ...overrides,
+  };
+}
+
+function nodeState(overrides: Partial<FleetNodeState> & { nodeId: string }): FleetNodeState {
+  return {
+    online: true,
+    cpuPercent: 10,
+    freeMemMb: 8192,
+    activeAgents: 0,
+    activeBurnRuns: 0,
+    meterSummary: null,
+    freePoolUpdatedAt: null,
+    runsUpdatedAt: null,
+    collectedAt: "2026-10-17T10:00:00.000Z",
+    name: overrides.nodeId,
+    posture: "stationary",
+    slotCeiling: 2,
+    reserveMode: false,
+    healthGuard: { ...DEFAULT_HEALTH_GUARD },
+    slotsInUse: 0,
+    lastError: null,
+    ...overrides,
+  };
+}
+
+function fleetStateOf(nodes: FleetNodeState[], localNodeId = "laptop"): FleetState {
+  return { version: 1, localNodeId, updatedAt: "2026-10-17T10:00:00.000Z", nodes };
+}
+
+/** Persists a registry whose local `Node` is the `laptop` (mobile initiator). */
+function seedRegistry(home: string, nodes: FleetNode[]): void {
+  saveFleetConfig(home, {
+    version: 1,
+    localNodeId: "laptop",
+    nodes: [fleetNode({ id: "laptop", name: "Laptop", posture: "mobile", transport: "local" }), ...nodes],
+  });
+}
+
+/**
+ * Simulated target `Node`: the `GitBundleTransport` really copies files into a
+ * temp target home's inbox, and the `RemoteCommandRunner` really executes the
+ * composed `connector-dispatch receive-handoff` command against that home —
+ * exactly what the production bridge on the peer would do, minus SSH.
+ */
+function simulatedTargetNode(targetHome: string, spawn: DetachedSpawn): {
+  transport: GitBundleTransport;
+  remoteRunner: RemoteCommandRunner;
+  commands: Array<{ nodeId: string; command: string }>;
+} {
+  const commands: Array<{ nodeId: string; command: string }> = [];
+  const toTargetPath = (remote: string): string => remote.replace(/^~\/?/, `${targetHome}/`);
+  return {
+    commands,
+    transport: {
+      async copyToNode(_node, localPath, remoteDir) {
+        const dir = toTargetPath(remoteDir);
+        mkdirSync(dir, { recursive: true });
+        const destination = join(dir, basename(localPath));
+        copyFileSync(localPath, destination);
+        return `${remoteDir}/${basename(localPath)}`;
+      },
+    },
+    remoteRunner: {
+      async run(node, command) {
+        commands.push({ nodeId: node.id, command });
+        const match = /--manifest '([^']+)'/.exec(command);
+        if (!match) throw new Error(`unexpected remote command: ${command}`);
+        const record = await receiveHandoff({
+          paseoHome: targetHome,
+          manifestPath: toTargetPath(match[1]),
+          spawn,
+        });
+        return { stdout: `${record.pid}\n`, stderr: "" };
       },
     },
   };
@@ -185,5 +285,258 @@ describe("receiveHandoff (target Node side)", () => {
       () => receiveHandoff({ paseoHome: targetHome, manifestPath: join(inboxDir, "missing.json") }),
       /missing\.json/,
     );
+  });
+});
+
+describe("dispatchHandoff (initiating Node side)", () => {
+  const dispatchedAt = new Date("2026-10-17T10:00:02.000Z");
+  const brief = {
+    kind: "burn-run" as const,
+    runOrTaskId: "run-42",
+    command: "npx burn run --playbook probe",
+    playbook: "probe",
+    prompt: "compare three models",
+  };
+
+  /** Registry + snapshot: laptop (local, mobile) + two stationary peers + one mobile peer. */
+  function seededFleet(): {
+    initiatorHome: string;
+    state: FleetState;
+  } {
+    const initiatorHome = makeTempHome("dispatch-initiator");
+    seedRegistry(initiatorHome, [
+      fleetNode({ id: "studio-a", name: "Studio A", posture: "stationary" }),
+      fleetNode({ id: "studio-b", name: "Studio B", posture: "stationary", slotCeiling: 1 }),
+      fleetNode({ id: "peer-laptop", name: "Peer Laptop", posture: "mobile" }),
+    ]);
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", name: "Laptop", posture: "mobile", slotsInUse: 0 }),
+      nodeState({ nodeId: "studio-a", name: "Studio A", posture: "stationary", slotsInUse: 1, slotCeiling: 2 }),
+      nodeState({ nodeId: "studio-b", name: "Studio B", posture: "stationary", slotCeiling: 1 }),
+      nodeState({ nodeId: "peer-laptop", name: "Peer Laptop", posture: "mobile" }),
+    ]);
+    return { initiatorHome, state };
+  }
+
+  it("packages the bundle, transfers it to the stationary Host node, and records a dispatch that survives disconnect", async () => {
+    const { repo, base, head } = await makeProjectWithInclude();
+    const { initiatorHome, state } = seededFleet();
+    const targetHome = makeTempHome("dispatch-target");
+    const { spawns, spawn } = recordingSpawn();
+    const { transport, remoteRunner, commands } = simulatedTargetNode(targetHome, spawn);
+
+    const record = await dispatchHandoff({
+      paseoHome: initiatorHome,
+      projectPath: repo,
+      base,
+      canonicalSlug: "my-proj",
+      brief,
+      state,
+      targetNodeId: "auto-stationary",
+      handoffId: "ho-1",
+      bundleTransport: transport,
+      remoteRunner,
+      now: () => dispatchedAt,
+    });
+
+    // Outbound record: ownership transferred, Fleet ref named for later reconciliation.
+    assert.equal(record.direction, "outbound");
+    assert.equal(record.status, "dispatched");
+    assert.equal(record.targetNodeId, "studio-a");
+    assert.equal(record.sourceNodeId, "laptop");
+    assert.equal(record.expectedFleetRef, "refs/fleet/studio-a/run-42");
+    assert.equal(record.pid, "31337");
+    assert.equal(record.bundle.headCommit, head);
+    assert.equal(record.bundle.baseCommit, base);
+    assert.deepEqual(loadHandoff(initiatorHome, "ho-1"), record);
+
+    // The remote side was asked to receive via the peer's own bridge binary.
+    assert.equal(commands.length, 1);
+    assert.equal(commands[0].nodeId, "studio-a");
+    assert.ok(
+      commands[0].command.includes(
+        "~/.paseo-factory/connector/bin/connector-dispatch receive-handoff --manifest",
+      ),
+      `unexpected remote command: ${commands[0].command}`,
+    );
+    assert.ok(commands[0].command.includes("~/.paseo-factory/connector/inbox/ho-1/handoff.json"));
+
+    // Target side is fully self-sufficient (initiator may disconnect now).
+    const mirrorPath = join(targetHome, "connector", "repos", "my-proj");
+    assert.equal((await git(mirrorPath, "rev-parse", "HEAD")).trim(), head);
+    assert.equal(readFileSync(join(mirrorPath, ".env"), "utf8"), "TOKEN=hush\n");
+    const inbound = loadHandoff(targetHome, "ho-1");
+    assert.ok(inbound);
+    assert.equal(inbound.direction, "inbound");
+    assert.equal(inbound.status, "running");
+    assert.equal(inbound.mirrorPath, mirrorPath);
+    assert.equal(spawns.length, 1);
+    assert.equal(spawns[0].command, brief.command);
+
+    // Slot accounting: the dispatched run occupies one target slot in the snapshot.
+    const snapshot = loadFleetState(initiatorHome);
+    assert.ok(snapshot);
+    assert.equal(snapshot.nodes.find((node) => node.nodeId === "studio-a")?.slotsInUse, 2);
+    assert.equal(snapshot.nodes.find((node) => node.nodeId === "studio-b")?.slotsInUse, 0);
+  });
+
+  it("auto-stationary prefers the stationary Node with the most free slots over an idle mobile peer", async () => {
+    const { repo, base } = await makeProjectWithInclude();
+    const { initiatorHome, state } = seededFleet();
+    const { spawn } = recordingSpawn();
+    const { transport, remoteRunner, commands } = simulatedTargetNode(makeTempHome("dispatch-target"), spawn);
+
+    await dispatchHandoff({
+      paseoHome: initiatorHome,
+      projectPath: repo,
+      base,
+      canonicalSlug: "my-proj",
+      brief,
+      state,
+      bundleTransport: transport,
+      remoteRunner,
+    });
+
+    // studio-a has 1 free slot, studio-b 1 free slot, peer-laptop 2 but mobile:
+    // stationary wins; among the stationary pair selectEligibleNodes breaks the
+    // free-slot tie by lower CPU then id order (both cpu 10 → studio-a first).
+    assert.equal(commands.length, 1);
+    assert.equal(commands[0].nodeId, "studio-a");
+  });
+
+  it("honours an explicit targetNodeId", async () => {
+    const { repo, base } = await makeProjectWithInclude();
+    const { initiatorHome, state } = seededFleet();
+    const { spawn } = recordingSpawn();
+    const { transport, remoteRunner, commands } = simulatedTargetNode(makeTempHome("dispatch-target"), spawn);
+
+    const record = await dispatchHandoff({
+      paseoHome: initiatorHome,
+      projectPath: repo,
+      base,
+      canonicalSlug: "my-proj",
+      brief,
+      state,
+      targetNodeId: "studio-b",
+      bundleTransport: transport,
+      remoteRunner,
+    });
+
+    assert.equal(record.targetNodeId, "studio-b");
+    assert.equal(commands[0].nodeId, "studio-b");
+    assert.equal(record.expectedFleetRef, "refs/fleet/studio-b/run-42");
+  });
+
+  it("refuses an explicit target that is offline or in Reserve mode, without recording a handoff", async () => {
+    const { repo, base } = await makeProjectWithInclude();
+    const { initiatorHome, state } = seededFleet();
+    state.nodes = state.nodes.map((node) =>
+      node.nodeId === "studio-b" ? { ...node, online: false } : node,
+    );
+    const { spawn } = recordingSpawn();
+    const { transport, remoteRunner } = simulatedTargetNode(makeTempHome("dispatch-target"), spawn);
+
+    await assert.rejects(
+      () =>
+        dispatchHandoff({
+          paseoHome: initiatorHome,
+          projectPath: repo,
+          base,
+          canonicalSlug: "my-proj",
+          brief,
+          state,
+          targetNodeId: "studio-b",
+          bundleTransport: transport,
+          remoteRunner,
+        }),
+      /studio-b.*offline|offline.*studio-b/s,
+    );
+
+    const reserved = fleetStateOf([
+      nodeState({ nodeId: "laptop", posture: "mobile" }),
+      nodeState({ nodeId: "studio-a", reserveMode: true }),
+    ]);
+    await assert.rejects(
+      () =>
+        dispatchHandoff({
+          paseoHome: initiatorHome,
+          projectPath: repo,
+          base,
+          canonicalSlug: "my-proj",
+          brief,
+          state: reserved,
+          targetNodeId: "studio-a",
+          bundleTransport: transport,
+          remoteRunner,
+        }),
+      /Reserve mode/,
+    );
+
+    assert.equal(loadHandoff(initiatorHome, "ho-anything"), null);
+  });
+
+  it("refuses when no stationary Node is eligible and no record or bundle is left behind", async () => {
+    const { repo, base } = await makeProjectWithInclude();
+    const { initiatorHome } = seededFleet();
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", posture: "mobile" }),
+      nodeState({ nodeId: "peer-laptop", posture: "mobile" }),
+      nodeState({ nodeId: "studio-a", posture: "stationary", reserveMode: true }),
+    ]);
+    const { spawn } = recordingSpawn();
+    const { transport, remoteRunner } = simulatedTargetNode(makeTempHome("dispatch-target"), spawn);
+
+    await assert.rejects(
+      () =>
+        dispatchHandoff({
+          paseoHome: initiatorHome,
+          projectPath: repo,
+          base,
+          canonicalSlug: "my-proj",
+          brief,
+          state,
+          bundleTransport: transport,
+          remoteRunner,
+        }),
+      /no eligible stationary/i,
+    );
+    // Selection happens before packaging: nothing was staged.
+    assert.equal(existsSync(join(initiatorHome, "connector", "handoffs")), false);
+  });
+
+  it("records a failed handoff when the peer cannot receive, and rethrows", async () => {
+    const { repo, base } = await makeProjectWithInclude();
+    const { initiatorHome, state } = seededFleet();
+    const remoteRunner: RemoteCommandRunner = {
+      async run() {
+        throw new Error("ssh: connection reset by peer");
+      },
+    };
+    const transport: GitBundleTransport = {
+      async copyToNode(_node, localPath, remoteDir) {
+        return `${remoteDir}/${basename(localPath)}`;
+      },
+    };
+
+    await assert.rejects(
+      () =>
+        dispatchHandoff({
+          paseoHome: initiatorHome,
+          projectPath: repo,
+          base,
+          canonicalSlug: "my-proj",
+          brief,
+          state,
+          handoffId: "ho-fail",
+          bundleTransport: transport,
+          remoteRunner,
+        }),
+      /connection reset/,
+    );
+
+    const failed = loadHandoff(initiatorHome, "ho-fail");
+    assert.ok(failed);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error ?? "", /connection reset/);
   });
 });

@@ -5,3 +5,4 @@
 
 export * from "./fleet.ts";
 export * from "./git-sync.ts";
+export * from "./dispatch.ts";
