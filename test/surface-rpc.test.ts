@@ -274,3 +274,50 @@ describe("connector.node.reserve", () => {
     assert.match(reply.error, /ghost/);
   });
 });
+
+describe("connector.node.remove", () => {
+  it("removes a peer Node from the registry and the rendered view", async () => {
+    const home = makeTempHome("remove");
+    seedRegistry(home, [fleetNode({ id: "studio-a" }), fleetNode({ id: "studio-b" })]);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.nodeRemove({ nodeId: "studio-a" });
+
+    assert.equal(reply.ok, true);
+    if (!reply.ok) return;
+    assert.ok(!reply.view.nodes.some((node) => node.id === "studio-a"));
+    assert.ok(reply.view.nodes.some((node) => node.id === "studio-b"));
+    assert.ok(reply.view.nodes.some((node) => node.id === "laptop"));
+    // The removal persisted.
+    const again = await handlers.snapshot({});
+    assert.ok(again.ok && !again.view.nodes.some((node) => node.id === "studio-a"));
+  });
+
+  it("refuses to remove the local Node — the registry would orphan itself", async () => {
+    const home = makeTempHome("remove-local");
+    seedRegistry(home, [fleetNode({ id: "studio-a" })]);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.nodeRemove({ nodeId: "laptop" });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "local-node");
+    assert.match(reply.error, /local/);
+    // Nothing was removed.
+    const after = await handlers.snapshot({});
+    assert.ok(after.ok && after.view.nodes.length === 2);
+  });
+
+  it("refuses to remove a Node the Fleet does not know", async () => {
+    const home = makeTempHome("remove-unknown");
+    seedRegistry(home, []);
+    const handlers = makeHandlers(home);
+
+    const reply = await handlers.nodeRemove({ nodeId: "ghost" });
+
+    assert.equal(reply.ok, false);
+    if (reply.ok) return;
+    assert.equal(reply.code, "unknown-node");
+  });
+});

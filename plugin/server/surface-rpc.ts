@@ -9,11 +9,11 @@
  * temp paseo home, production defaults to Tailscale SSH in BatchMode.
  */
 import type { PluginServerContext } from "@getpaseo/plugin/server";
-import { setNodeReserveMode, upsertNode, type CommandRunner, type LocalPulseSource, type PulseTransport } from "./core/fleet.ts";
+import { loadFleetConfig, removeNode, setNodeReserveMode, upsertNode, type CommandRunner, type LocalPulseSource, type PulseTransport } from "./core/fleet.ts";
 import type { GossipArtifactTransport } from "./core/git-sync.ts";
 import type { GitBundleTransport, RemoteCommandRunner } from "./core/dispatch.ts";
 import { foldFleetView } from "./view.ts";
-import { nodeReserve, nodeUpsert, snapshot } from "../shared/rpc.ts";
+import { nodeRemove, nodeReserve, nodeUpsert, snapshot } from "../shared/rpc.ts";
 import type { FleetNodeInputView, FleetView } from "../shared/view.ts";
 
 /** What each `server.handle` call passes besides the parsed input. */
@@ -89,6 +89,27 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         return failure("unknown-node", messageOf(error));
       }
     },
+
+    async nodeRemove(input: { nodeId: string }) {
+      // The refusal codes the operator acts on: unknown peer vs the local Node.
+      const config = loadFleetConfig(deps.paseoHome);
+      if (!config.nodes.some((node) => node.id === input.nodeId)) {
+        return failure("unknown-node", `no Node with id ${JSON.stringify(input.nodeId)} in the Fleet`);
+      }
+      if (input.nodeId === config.localNodeId) {
+        return failure(
+          "local-node",
+          "the local Node cannot be removed from the Fleet registry — it anchors who is running this connector",
+        );
+      }
+      try {
+        removeNode(deps.paseoHome, input.nodeId);
+        log(`node.remove: ${input.nodeId} unregistered`);
+        return { ok: true as const, view: view() };
+      } catch (error) {
+        return failure("remove-failed", messageOf(error));
+      }
+    },
   };
 }
 
@@ -102,5 +123,6 @@ export type SurfaceHandlers = ReturnType<typeof createSurfaceHandlers>;
 export function registerSurfaceRpc(server: PluginServerContext, handlers: SurfaceHandlers): void {
   server.handle(snapshot, (input) => handlers.snapshot(input));
   server.handle(nodeUpsert, (input) => handlers.nodeUpsert(input));
+  server.handle(nodeRemove, (input) => handlers.nodeRemove(input));
   server.handle(nodeReserve, (input) => handlers.nodeReserve(input));
 }

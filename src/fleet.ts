@@ -264,6 +264,27 @@ export function setNodeReserveMode(
   return config;
 }
 
+/**
+ * Unregisters a peer `Node` from the `Fleet` registry. The local `Node`
+ * (`localNodeId`) cannot be removed — the registry would lose its anchor and
+ * every subsequent fold would mislabel who is running this connector.
+ */
+export function removeNode(paseoHome: string, nodeId: string): FleetConfig {
+  const config = loadFleetConfig(paseoHome);
+  if (nodeId === config.localNodeId) {
+    throw new Error(
+      "factory-connector: the local Node cannot be removed from the Fleet registry",
+    );
+  }
+  const index = config.nodes.findIndex((candidate) => candidate.id === nodeId);
+  if (index === -1) {
+    throw new Error(`factory-connector: no Node with id ${JSON.stringify(nodeId)} in the Fleet`);
+  }
+  config.nodes.splice(index, 1);
+  saveFleetConfig(paseoHome, config);
+  return config;
+}
+
 /** Local machine facts a `Fleet pulse` is built from, minus transport bookkeeping. */
 export interface LocalPulseSample {
   cpuPercent: number;
