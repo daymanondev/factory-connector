@@ -12,6 +12,7 @@ import {
   fleetRef,
   fleetRefBranch,
   stageFleetRefFromBundle,
+  landFleetRef,
 } from "../src/git-sync.ts";
 
 const execFileAsync = promisify(execFile);
@@ -349,5 +350,106 @@ describe("stageFleetRefFromBundle (refs/fleet/<nodeId>/<runOrTaskId>)", () => {
   it("fleetRef/fleetRefBuild helpers spell the ref and branch namespaces", () => {
     assert.equal(fleetRef("mac-studio", "run-42"), "refs/fleet/mac-studio/run-42");
     assert.equal(fleetRefBranch("mac-studio", "run-42"), "fleet/mac-studio/run-42");
+  });
+});
+
+describe("landFleetRef (explicit operator Land)", () => {
+  /** Initiator at base, clean tree, with the peer's completion already staged. */
+  async function stagedFleetRefFixture(): Promise<{
+    repo: string;
+    base: string;
+    peerHead: string;
+  }> {
+    const { repo, base, peerHead, bundlePath } = await (async () => {
+      const root = makeTempDir("git-sync-land");
+      const repo = await initRepo(join(root, "proj"));
+      writeFileSync(join(repo, "file.txt"), "one\n", "utf8");
+      await commitAll(repo, "one");
+      const base = (await git(repo, "rev-parse", "HEAD")).trim();
+
+      const peerDir = join(root, "peer");
+      await execFileAsync("git", ["clone", "-q", repo, peerDir]);
+      writeFileSync(join(peerDir, "file.txt"), "peer result\n", "utf8");
+      const peerHead = await commitAll(peerDir, "peer completed the run");
+
+      const bundlePath = join(root, "attempt.bundle");
+      await execFileAsync("git", ["-C", peerDir, "bundle", "create", bundlePath, `${base}..HEAD`]);
+      return { repo, base, peerHead, bundlePath };
+    })();
+
+    await stageFleetRefFromBundle({ repoPath: repo, bundlePath, nodeId: "mac-studio", runOrTaskId: "run-42" });
+    return { repo, base, peerHead };
+  }
+
+  it("checkout mode materializes and switches to the fleet/<nodeId>/<runId> branch at the ref", async () => {
+    const { repo, peerHead } = await stagedFleetRefFixture();
+
+    const landed = await landFleetRef({
+      repoPath: repo,
+      nodeId: "mac-studio",
+      runOrTaskId: "run-42",
+      mode: "checkout",
+    });
+
+    assert.equal(landed.branch, "fleet/mac-studio/run-42");
+    assert.equal(landed.commit, peerHead);
+    assert.equal(landed.mode, "checkout");
+    assert.equal((await git(repo, "branch", "--show-current")).trim(), "fleet/mac-studio/run-42");
+    assert.equal((await git(repo, "rev-parse", "HEAD")).trim(), peerHead);
+    assert.equal(readFileSync(join(repo, "file.txt"), "utf8"), "peer result\n");
+    // The staged ref itself survives landing.
+    assert.equal((await git(repo, "rev-parse", "refs/fleet/mac-studio/run-42")).trim(), peerHead);
+  });
+
+  it("merge mode fast-forwards the current branch when it is behind the ref", async () => {
+    const { repo, peerHead } = await stagedFleetRefFixture();
+
+    const landed = await landFleetRef({
+      repoPath: repo,
+      nodeId: "mac-studio",
+      runOrTaskId: "run-42",
+      mode: "merge",
+    });
+
+    assert.equal(landed.mode, "merge");
+    assert.equal(landed.commit, peerHead);
+    assert.equal((await git(repo, "rev-parse", "--abbrev-ref", "HEAD")).trim(), "main");
+    assert.equal((await git(repo, "rev-parse", "HEAD")).trim(), peerHead);
+    assert.equal(readFileSync(join(repo, "file.txt"), "utf8"), "peer result\n");
+  });
+
+  it("merge mode merges (not fast-forwards) when local history diverged from the ref", async () => {
+    const { repo, peerHead } = await stagedFleetRefFixture();
+    // Local work continues on main while the peer ran remotely.
+    writeFileSync(join(repo, "local.txt"), "local work\n", "utf8");
+    await commitAll(repo, "local work");
+
+    const landed = await landFleetRef({
+      repoPath: repo,
+      nodeId: "mac-studio",
+      runOrTaskId: "run-42",
+      mode: "merge",
+    });
+
+    assert.equal((await git(repo, "rev-parse", "--abbrev-ref", "HEAD")).trim(), "main");
+    // A merge commit exists with both parents; landed.commit is the resulting HEAD.
+    const head = (await git(repo, "rev-parse", "HEAD")).trim();
+    assert.equal(landed.commit, head);
+    const parents = (await git(repo, "rev-list", "--parents", "-n", "1", "HEAD")).trim().split(" ");
+    assert.equal(parents.length, 3);
+    assert.ok(parents.includes(peerHead), "peer head is a merge parent");
+    assert.equal(readFileSync(join(repo, "file.txt"), "utf8"), "peer result\n");
+    assert.equal(readFileSync(join(repo, "local.txt"), "utf8"), "local work\n");
+  });
+
+  it("defaults to checkout mode and refuses to land a ref that was never staged", async () => {
+    const { repo } = await stagedFleetRefFixture();
+    const landed = await landFleetRef({ repoPath: repo, nodeId: "mac-studio", runOrTaskId: "run-42" });
+    assert.equal(landed.mode, "checkout");
+
+    await assert.rejects(
+      () => landFleetRef({ repoPath: repo, nodeId: "win-wsl", runOrTaskId: "run-99" }),
+      /refs\/fleet\/win-wsl\/run-99/,
+    );
   });
 });

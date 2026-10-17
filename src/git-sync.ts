@@ -332,3 +332,59 @@ export async function stageFleetRefFromBundle(options: {
   const commit = (await runGit(runner, options.repoPath, ["rev-parse", ref])).trim();
   return { ref, commit };
 }
+
+/** How the operator asked a `Fleet ref` to be applied. */
+export type LandFleetRefMode = "checkout" | "merge";
+
+/** Result of landing a staged `Fleet ref`. */
+export interface LandedFleetRef {
+  /** Local branch the `Fleet ref` was materialized as (`fleet/<nodeId>/<runId>`). */
+  branch: string;
+  /** Commit landed at. */
+  commit: string;
+  mode: LandFleetRefMode;
+}
+
+/**
+ * The explicit 1-click **`Land`**: applies a staged `Fleet ref`
+ * (`refs/fleet/<nodeId>/<runOrTaskId>`) to the repository. Unlike staging,
+ * landing deliberately touches the checkout:
+ *
+ * - `checkout` (default) materializes the local branch
+ *   `fleet/<nodeId>/<runOrTaskId>` at the ref and switches to it — the
+ *   review-and-inspect path.
+ * - `merge` merges the ref into the current branch (fast-forwarding when the
+ *   branch is behind, creating a merge commit when histories diverged) — the
+ *   apply-the-code path.
+ */
+export async function landFleetRef(options: {
+  repoPath: string;
+  nodeId: string;
+  runOrTaskId: string;
+  mode?: LandFleetRefMode;
+  runner?: CommandRunner;
+}): Promise<LandedFleetRef> {
+  const runner = options.runner ?? execCommandRunner;
+  const mode = options.mode ?? "checkout";
+  const ref = fleetRef(options.nodeId, options.runOrTaskId);
+  const branch = fleetRefBranch(options.nodeId, options.runOrTaskId);
+
+  let commit: string;
+  try {
+    commit = (await runGit(runner, options.repoPath, ["rev-parse", ref])).trim();
+  } catch {
+    throw new Error(
+      `factory-connector: cannot land ${ref}: the Fleet ref is not staged in ` +
+        `${options.repoPath}; stage it with stageFleetRefFromBundle first`,
+    );
+  }
+
+  if (mode === "checkout") {
+    await runGit(runner, options.repoPath, ["checkout", "-q", "-B", branch, commit]);
+  } else {
+    await runGit(runner, options.repoPath, ["merge", "--no-edit", "--no-gpg-sign", ref]);
+  }
+
+  const headAfter = (await runGit(runner, options.repoPath, ["rev-parse", "HEAD"])).trim();
+  return { branch, commit: mode === "checkout" ? commit : headAfter, mode };
+}
