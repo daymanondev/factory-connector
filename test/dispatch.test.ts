@@ -806,3 +806,111 @@ describe("executeBurst (cooperative parallel execution)", () => {
     );
   });
 });
+
+describe("executeBurst failover (peer drops mid-attempt)", () => {
+  const burstStartedAt = new Date("2026-10-17T11:00:00.000Z");
+
+  function seededFailoverFleet(): { initiatorHome: string; state: FleetState } {
+    const initiatorHome = makeTempHome("burst-failover");
+    seedRegistry(initiatorHome, [
+      fleetNode({ id: "dropper", name: "Dropper", posture: "stationary", slotCeiling: 2 }),
+      fleetNode({ id: "survivor", name: "Survivor", posture: "stationary", slotCeiling: 1 }),
+    ]);
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", name: "Laptop", posture: "mobile", slotCeiling: 2, slotsInUse: 2 }),
+      nodeState({ nodeId: "dropper", name: "Dropper", posture: "stationary", slotCeiling: 2 }),
+      nodeState({ nodeId: "survivor", name: "Survivor", posture: "stationary", slotCeiling: 1 }),
+    ]);
+    return { initiatorHome, state };
+  }
+
+  it("retries units on a surviving Node when a peer times out mid-attempt", async () => {
+    const { initiatorHome, state } = seededFailoverFleet();
+    const dropperCalls: string[] = [];
+    const survivorCommands: string[] = [];
+
+    const report = await executeBurst({
+      paseoHome: initiatorHome,
+      state,
+      units: [
+        { id: "probe-1", command: "scout --model a" },
+        { id: "probe-2", command: "scout --model b" },
+      ],
+      // The dropper accepts both units (most free slots) then hangs — the
+      // laptop closed its lid mid-attempt. The survivor is slower to schedule
+      // (1 slot) but alive.
+      remoteRunner: {
+        async run(node, command) {
+          if (node.id === "dropper") {
+            dropperCalls.push(command);
+            return await new Promise<{ stdout: string; stderr: string }>(() => {});
+          }
+          survivorCommands.push(command);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return { stdout: "ok", stderr: "" };
+        },
+      },
+      attemptTimeoutMs: 80,
+      now: () => burstStartedAt,
+    });
+
+    assert.equal(report.ok, true, JSON.stringify(report.results));
+    // Both units were dispatched to the dropper before it went silent.
+    assert.equal(dropperCalls.length, 2);
+    assert.equal(survivorCommands.length, 2);
+
+    for (const result of report.results) {
+      assert.equal(result.ok, true);
+      assert.equal(result.nodeId, "survivor");
+      assert.equal(result.attempts.length, 2);
+      const [dropped, retried] = result.attempts;
+      assert.equal(dropped.nodeId, "dropper");
+      assert.equal(dropped.ok, false);
+      assert.match(dropped.error ?? "", /timed out/);
+      assert.equal(retried.nodeId, "survivor");
+      assert.equal(retried.ok, true);
+      assert.equal(retried.stdout, "ok");
+    }
+
+    // The dropped peer's slots were released for the whole Fleet to see.
+    const settled = loadFleetState(initiatorHome);
+    assert.ok(settled);
+    assert.equal(settled.nodes.find((node) => node.nodeId === "dropper")?.slotsInUse, 0);
+    assert.equal(settled.nodes.find((node) => node.nodeId === "survivor")?.slotsInUse, 0);
+  });
+
+  it("fails a unit only after every eligible Node has failed it, recording each attempt", async () => {
+    const { initiatorHome, state } = seededFailoverFleet();
+    const attemptLog: string[] = [];
+
+    const report = await executeBurst({
+      paseoHome: initiatorHome,
+      state,
+      units: [{ id: "probe-1", command: "scout --model a" }],
+      remoteRunner: {
+        async run(node, command) {
+          attemptLog.push(`${node.id}:${command}`);
+          throw new Error("ssh: connection reset by peer");
+        },
+      },
+      attemptTimeoutMs: 500,
+      now: () => burstStartedAt,
+    });
+
+    assert.equal(report.ok, false);
+    const result = report.results[0];
+    assert.equal(result.ok, false);
+    assert.equal(result.nodeId, null);
+    assert.equal(result.attempts.length, 2);
+    assert.deepEqual(result.attempts.map((attempt) => attempt.nodeId).sort(), ["dropper", "survivor"]);
+    for (const attempt of result.attempts) {
+      assert.equal(attempt.ok, false);
+      assert.match(attempt.error ?? "", /connection reset/);
+    }
+    assert.equal(attemptLog.length, 2);
+
+    const settled = loadFleetState(initiatorHome);
+    assert.ok(settled);
+    assert.equal(settled.nodes.find((node) => node.nodeId === "dropper")?.slotsInUse, 0);
+  });
+});
