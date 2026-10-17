@@ -85,8 +85,16 @@ export default function contribute(server: PluginServerContext) {
 
   // The Connector bridge: publish the snapshot and the connector-dispatch CLI
   // wrapper so sibling repos can consume the Fleet with zero code imports.
+  // The daemon evaluates this bundle as CommonJS without `import.meta`, so the
+  // CLI entry is resolved from the daemon's install records (config.json /
+  // staged checkouts) inside ensureConnectorBridge.
   void ensureConnectorBridge({ paseoHome: home }).then(
-    (bridge) => log(`bridge: ${bridge.statePath} + ${bridge.dispatchPath} ready`),
+    (bridge) =>
+      log(
+        bridge.dispatchPath === undefined
+          ? `bridge: ${bridge.statePath} ready (dispatch wrapper skipped — no resolvable CLI entry)`
+          : `bridge: ${bridge.statePath} + ${bridge.dispatchPath} ready`,
+      ),
     (error) => log(`bridge: initial write failed: ${error instanceof Error ? error.message : String(error)}`),
   );
 

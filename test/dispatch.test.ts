@@ -9,9 +9,10 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   createCommitBundle,
   stageFleetRefFromBundle,
@@ -28,6 +29,7 @@ import {
   dispatchHandoff,
   executeBurst,
   ensureConnectorBridge,
+  coreCliCandidates,
   loadHandoff,
   handoffRecordPath,
   handoffStagingDir,
@@ -900,12 +902,14 @@ describe("ensureConnectorBridge (Connector bridge contract)", () => {
     assert.deepEqual(JSON.parse(readFileSync(fleetStatePath(home), "utf8")), state);
 
     // The wrapper is executable and execs node against the core CLI with the home.
-    assert.equal(bridge.dispatchPath, join(home, "connector", "bin", "connector-dispatch"));
-    const script = readFileSync(bridge.dispatchPath, "utf8");
+    const wrapperPath = bridge.dispatchPath;
+    assert.ok(wrapperPath !== undefined, "an explicit coreCliPath must produce a wrapper");
+    assert.equal(wrapperPath, join(home, "connector", "bin", "connector-dispatch"));
+    const script = readFileSync(wrapperPath, "utf8");
     assert.ok(script.startsWith("#!/bin/sh\n"), script);
     assert.ok(script.includes(`exec node "${coreCliPath}"`), script);
     assert.ok(script.includes(`--home "${home}"`), script);
-    assert.ok((statSync(bridge.dispatchPath).mode & 0o111) !== 0, "wrapper must be executable");
+    assert.ok((statSync(wrapperPath).mode & 0o111) !== 0, "wrapper must be executable");
   });
 
   it("polls through the injected transport when no snapshot is supplied", async () => {
@@ -945,7 +949,9 @@ describe("ensureConnectorBridge (Connector bridge contract)", () => {
 
     const bridge = await ensureConnectorBridge({ paseoHome: home });
 
-    const { stdout, stderr } = await execFileAsync(bridge.dispatchPath, ["snapshot"], {
+    const dispatchPath = bridge.dispatchPath;
+    assert.ok(dispatchPath !== undefined, "a resolvable CLI entry must produce a wrapper");
+    const { stdout, stderr } = await execFileAsync(dispatchPath, ["snapshot"], {
       timeout: 60_000,
     });
     assert.equal(stderr, "");
@@ -954,5 +960,51 @@ describe("ensureConnectorBridge (Connector bridge contract)", () => {
     assert.equal(snapshot.nodes[0].online, true);
     assert.equal(snapshot.nodes[0].slotsInUse, 0);
     assert.ok(typeof snapshot.nodes[0].cpuPercent === "number");
+  });
+
+  it("resolves the CLI entry from the daemon's install records when the module cannot see its own directory", () => {
+    const home = makeTempHome("bridge-candidates");
+
+    // No install records at all: no candidates, the caller degrades visibly.
+    assert.deepEqual(coreCliCandidates(home), []);
+
+    // A directory install recorded in config.json is the first candidate.
+    const dirSource = makeTempDir("bridge-candidates-dir");
+    const dirCli = join(dirSource, "server", "core", "dispatch-cli.ts");
+    mkdirSync(dirname(dirCli), { recursive: true });
+    writeFileSync(dirCli, "// stand-in\n", "utf8");
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({
+        plugins: { "factory-connector": { source: "directory", path: dirSource, enabled: true } },
+      }),
+      "utf8",
+    );
+    assert.deepEqual(coreCliCandidates(home), [dirCli]);
+
+    // A git install's staged checkouts are found too, newest first.
+    const staged = (name: string, ageMs: number): string => {
+      const cli = join(home, "plugins", "factory-connector", name, "checkout", "plugin", "server", "core", "dispatch-cli.ts");
+      mkdirSync(dirname(cli), { recursive: true });
+      writeFileSync(cli, "// stand-in\n", "utf8");
+      const atime = new Date(Date.now() - ageMs);
+      utimesSync(cli, atime, atime);
+      return cli;
+    };
+    const older = staged("11111111-1111-1111-1111-111111111111", 60_000);
+    const newer = staged("22222222-2222-2222-2222-222222222222", 1_000);
+    assert.deepEqual(coreCliCandidates(home), [dirCli, newer, older]);
+  });
+
+  it("skips the dispatch wrapper instead of crashing when no CLI entry resolves (coreCliPath: null)", async () => {
+    const home = makeTempHome("bridge-skip");
+    const state = fleetStateOf([nodeState({ nodeId: "laptop", name: "Laptop", posture: "mobile" })]);
+
+    const bridge = await ensureConnectorBridge({ paseoHome: home, state, coreCliPath: null });
+
+    // The snapshot is still published for sibling repos to read.
+    assert.deepEqual(JSON.parse(readFileSync(fleetStatePath(home), "utf8")), state);
+    assert.equal(bridge.dispatchPath, undefined);
+    assert.equal(existsSync(join(home, "connector", "bin", "connector-dispatch")), false);
   });
 });

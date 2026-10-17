@@ -18,7 +18,7 @@
  * run fully offline against temp directories.
  */
 
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -861,10 +861,71 @@ export function connectorDispatchPath(paseoHome: string): string {
 /**
  * Default entry the wrapper execs: the `dispatch-cli.ts` sitting next to this
  * module — `src/` in the repo, `plugin/server/core/` in the mirrored plugin
- * layout (both are the same directory relative to this file).
+ * layout (both are the same directory relative to this file). `undefined`
+ * when the module URL is not resolvable: the daemon evaluates the compiled
+ * plugin bundle as CommonJS without `import.meta`, so at plugin runtime this
+ * module cannot see its own source directory — callers then fall back to
+ * `coreCliCandidates`.
  */
-export function defaultCoreCliPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "dispatch-cli.ts");
+export function defaultCoreCliPath(): string | undefined {
+  try {
+    const url = import.meta.url;
+    if (typeof url !== "string" || url.length === 0) return undefined;
+    return join(dirname(fileURLToPath(url)), "dispatch-cli.ts");
+  } catch {
+    return undefined;
+  }
+}
+
+/** The plugin id under which the daemon records this plugin's install. */
+const CONNECTOR_PLUGIN_ID = "factory-connector";
+
+/**
+ * Where `dispatch-cli.ts` actually lives at plugin runtime, resolved from the
+ * daemon's own install records rather than from this module's (absent) source
+ * location: first the `directory`-source path recorded in
+ * `<paseoHome>/config.json` at install time, then the staged `git` checkouts
+ * under `<paseoHome>/plugins/<id>/<uuid>/checkout/plugin`, newest first.
+ * Empty when neither install layout can be found.
+ */
+export function coreCliCandidates(paseoHome: string): string[] {
+  const candidates: string[] = [];
+  try {
+    const entry = (
+      JSON.parse(readFileSync(join(paseoHome, "config.json"), "utf8")) as {
+        plugins?: Record<string, { source?: unknown; path?: unknown }>;
+      }
+    )?.plugins?.[CONNECTOR_PLUGIN_ID];
+    if (
+      typeof entry === "object" &&
+      entry !== null &&
+      entry.source === "directory" &&
+      typeof entry.path === "string"
+    ) {
+      candidates.push(join(entry.path, "server", "core", "dispatch-cli.ts"));
+    }
+  } catch {
+    // Unreadable config.json — fall through to the staged-checkout layout.
+  }
+  const stagedRoot = join(paseoHome, "plugins", CONNECTOR_PLUGIN_ID);
+  try {
+    const staged = readdirSync(stagedRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(stagedRoot, entry.name, "checkout", "plugin", "server", "core", "dispatch-cli.ts"))
+      .filter((path) => {
+        try {
+          statSync(path);
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    candidates.push(...staged);
+  } catch {
+    // No staged checkouts for this plugin id.
+  }
+  return candidates;
 }
 
 /**
@@ -882,9 +943,14 @@ export async function ensureConnectorBridge(options: {
   transport?: PulseTransport;
   localSource?: LocalPulseSource;
   now?: () => Date;
-  /** Entry the wrapper execs (defaults to the co-located `dispatch-cli.ts`). */
-  coreCliPath?: string;
-}): Promise<{ state: FleetState; statePath: string; dispatchPath: string }> {
+  /**
+   * Entry the wrapper execs, resolvable by `node`: defaults to the co-located
+   * `dispatch-cli.ts`, then to the installed plugin's copy
+   * (`coreCliCandidates`). Pass `null` to skip the wrapper entirely — the
+   * snapshot is still written and `dispatchPath` comes back `undefined`.
+   */
+  coreCliPath?: string | null;
+}): Promise<{ state: FleetState; statePath: string; dispatchPath: string | undefined }> {
   const state =
     options.state ??
     (await pollFleetPulse({
@@ -897,9 +963,19 @@ export async function ensureConnectorBridge(options: {
     saveFleetState(options.paseoHome, options.state);
   }
 
+  let coreCliPath: string | undefined;
+  if (options.coreCliPath !== undefined) {
+    // An explicit entry — `null` means "skip the wrapper entirely".
+    coreCliPath = options.coreCliPath ?? undefined;
+  } else {
+    coreCliPath = defaultCoreCliPath() ?? coreCliCandidates(options.paseoHome)[0];
+  }
+  if (coreCliPath === undefined) {
+    return { state, statePath: fleetStatePath(options.paseoHome), dispatchPath: undefined };
+  }
+
   const dispatchPath = connectorDispatchPath(options.paseoHome);
   mkdirSync(dirname(dispatchPath), { recursive: true });
-  const coreCliPath = options.coreCliPath ?? defaultCoreCliPath();
   const script =
     "#!/bin/sh\n" +
     "# Generated by factory-connector (ensureConnectorBridge) — do not edit.\n" +
