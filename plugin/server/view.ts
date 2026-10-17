@@ -54,8 +54,14 @@ export function readHandoffRecords(paseoHome: string): HandoffRecordView[] {
         )
           ? (raw.status as HandoffRecordView["status"])
           : "dispatched",
-        playbook: typeof raw.playbook === "string" ? raw.playbook : raw.brief?.playbook ?? null,
-        prompt: typeof raw.prompt === "string" ? raw.prompt : raw.brief?.prompt ?? null,
+        playbook:
+          typeof raw.playbook === "string"
+            ? raw.playbook
+            : ((raw.brief as Record<string, unknown> | undefined)?.playbook as string | undefined) ?? null,
+        prompt:
+          typeof raw.prompt === "string"
+            ? raw.prompt
+            : ((raw.brief as Record<string, unknown> | undefined)?.prompt as string | undefined) ?? null,
         canonicalSlug: String(raw.canonicalSlug),
         expectedFleetRef: String(raw.expectedFleetRef),
         dispatchedAt: String(raw.dispatchedAt),

@@ -62,7 +62,7 @@ export const FleetNodeInputSchema = z.object({
   remotePaseoHome: z.string().optional(),
   slotCeiling: z.number().int().min(1).optional(),
   reserveMode: z.boolean().optional(),
-  healthGuard: HealthGuardSchema.partial().optional(),
+  healthGuard: HealthGuardSchema.optional(),
 });
 export type FleetNodeInputView = z.infer<typeof FleetNodeInputSchema>;
 

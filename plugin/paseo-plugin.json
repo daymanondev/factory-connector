@@ -1,0 +1,7 @@
+{
+  "id": "factory-connector",
+  "description": "Symmetric peer Fleet over Tailscale: Fleet surface, 1-click Handoff, cooperative Burst, low-bandwidth Fleet pulse and Git-native Mirror repo / Fleet ref sync for paseo-factory & factory-burn-lab.",
+  "requirements": {
+    "paseo": ">=0.11.0 <0.12.0"
+  }
+}

@@ -61,7 +61,7 @@ export interface SurfaceDeps {
   /** Bundle mover for `Handoff` — defaults to `scp` over SSH (tests stub it). */
   bundleTransport?: GitBundleTransport;
   /** Peer command runner for `Handoff`/`Burst` — defaults to SSH (tests stub it). */
-  remoteRunner?: DispatchRemoteRunner;
+  remoteRunner?: RemoteCommandRunner;
   /** Local command runner for `Burst` on the local `Node` (tests stub it). */
   localRunner?: CommandRunner;
   /** `tailscale status --json` runner for discovery (tests stub it). */

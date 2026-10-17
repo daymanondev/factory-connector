@@ -27,7 +27,7 @@ import {
   type GitBundleTransport,
   type RemoteCommandRunner,
 } from "../src/dispatch.ts";
-import { createCommitBundle, stageFleetRefFromBundle } from "../src/git-sync.ts";
+import { createCommitBundle, stageFleetRefFromBundle, type GossipArtifactTransport } from "../src/git-sync.ts";
 import { createSurfaceHandlers } from "../plugin/server/surface-rpc.ts";
 import type { SurfaceDeps, SurfaceHandlers } from "../plugin/server/surface-rpc.ts";
 import { FleetViewSchema } from "../plugin/shared/view.ts";
@@ -619,7 +619,7 @@ describe("connector.gossip.sync", () => {
       ["burn-lab/runs/run-9/report.md", "# run-9 report\n"],
     ]);
     const gossipReads: string[] = [];
-    const gossipTransport = {
+    const gossipTransport: GossipArtifactTransport = {
       async readFile(node, relativePath) {
         gossipReads.push(`${node.id}:${relativePath}`);
         return gossipFiles.get(relativePath) ?? null;
