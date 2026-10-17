@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +32,7 @@ import {
   receiveHandoff,
   dispatchHandoff,
   executeBurst,
+  ensureConnectorBridge,
   loadHandoff,
   handoffRecordPath,
   type DetachedSpawn,
@@ -912,5 +914,80 @@ describe("executeBurst failover (peer drops mid-attempt)", () => {
     const settled = loadFleetState(initiatorHome);
     assert.ok(settled);
     assert.equal(settled.nodes.find((node) => node.nodeId === "dropper")?.slotsInUse, 0);
+  });
+});
+
+describe("ensureConnectorBridge (Connector bridge contract)", () => {
+  it("writes fleet-state.json and generates an executable connector-dispatch wrapper", async () => {
+    const home = makeTempHome("bridge");
+    const state = fleetStateOf([
+      nodeState({ nodeId: "laptop", name: "Laptop", posture: "mobile" }),
+      nodeState({ nodeId: "studio-a", name: "Studio A" }),
+    ]);
+
+    const coreCliPath = join(makeTempDir("bridge-cli"), "dispatch-cli.ts");
+    writeFileSync(coreCliPath, "// stand-in for the mirrored core CLI\n", "utf8");
+
+    const bridge = await ensureConnectorBridge({ paseoHome: home, state, coreCliPath });
+
+    // fleet-state.json carries the snapshot for burn-lab / paseo-factory to read.
+    assert.equal(bridge.statePath, fleetStatePath(home));
+    assert.deepEqual(JSON.parse(readFileSync(fleetStatePath(home), "utf8")), state);
+
+    // The wrapper is executable and execs node against the core CLI with the home.
+    assert.equal(bridge.dispatchPath, join(home, "connector", "bin", "connector-dispatch"));
+    const script = readFileSync(bridge.dispatchPath, "utf8");
+    assert.ok(script.startsWith("#!/bin/sh\n"), script);
+    assert.ok(script.includes(`exec node "${coreCliPath}"`), script);
+    assert.ok(script.includes(`--home "${home}"`), script);
+    assert.ok((statSync(bridge.dispatchPath).mode & 0o111) !== 0, "wrapper must be executable");
+  });
+
+  it("polls through the injected transport when no snapshot is supplied", async () => {
+    const home = makeTempHome("bridge-poll");
+    seedRegistry(home, [fleetNode({ id: "studio-a", name: "Studio A" })]);
+
+    const bridge = await ensureConnectorBridge({
+      paseoHome: home,
+      transport: {
+        async fetchPulse(node) {
+          return {
+            nodeId: node.id,
+            online: true,
+            cpuPercent: 42,
+            freeMemMb: 8192,
+            activeAgents: 1,
+            activeBurnRuns: 0,
+            meterSummary: null,
+            freePoolUpdatedAt: null,
+            runsUpdatedAt: null,
+            collectedAt: "2026-10-17T12:00:00.000Z",
+          };
+        },
+      },
+      localSource: async () => ({ cpuPercent: 7, freeMemMb: 4096 }),
+    });
+
+    const written = JSON.parse(readFileSync(fleetStatePath(home), "utf8"));
+    assert.equal(bridge.state.updatedAt, written.updatedAt);
+    assert.equal(written.nodes.find((node: FleetNodeState) => node.nodeId === "studio-a")?.cpuPercent, 42);
+  });
+
+  it("the generated wrapper really dispatches: snapshot runs offline against a local-only fleet", async () => {
+    const home = makeTempHome("bridge-live");
+    // No registry seeded: a fresh home defaults to a single local Node, so the
+    // snapshot poll never touches SSH.
+
+    const bridge = await ensureConnectorBridge({ paseoHome: home });
+
+    const { stdout, stderr } = await execFileAsync(bridge.dispatchPath, ["snapshot"], {
+      timeout: 60_000,
+    });
+    assert.equal(stderr, "");
+    const snapshot = JSON.parse(stdout) as FleetState;
+    assert.equal(snapshot.localNodeId, snapshot.nodes[0].nodeId);
+    assert.equal(snapshot.nodes[0].online, true);
+    assert.equal(snapshot.nodes[0].slotsInUse, 0);
+    assert.ok(typeof snapshot.nodes[0].cpuPercent === "number");
   });
 });
