@@ -1,0 +1,84 @@
+/**
+ * The `Fleet surface`'s in-process RPC handlers: every `connector.*` RPC runs
+ * inside the plugin server process against the co-located connector core
+ * (`plugin/server/core/`, mirrored verbatim from `src/` by
+ * `npm run sync:plugin-core`), so Owner acts from the UI — `Reserve mode`
+ * toggles, `Node` registration, `Handoff`, `Burst`, `Gossip sync`, `Land` —
+ * invoke the core directly. Every network/SSH/git seam is injectable through
+ * `SurfaceDeps` (spec.md "Injectable Transport Seams"); tests pass stubs and a
+ * temp paseo home, production defaults to Tailscale SSH in BatchMode.
+ */
+import type { PluginServerContext } from "@getpaseo/plugin/server";
+import type { CommandRunner, LocalPulseSource, PulseTransport } from "./core/fleet.ts";
+import type { GossipArtifactTransport } from "./core/git-sync.ts";
+import type { GitBundleTransport, RemoteCommandRunner } from "./core/dispatch.ts";
+import { foldFleetView } from "./view.ts";
+import { snapshot } from "../shared/rpc.ts";
+import type { FleetView } from "../shared/view.ts";
+
+/** What each `server.handle` call passes besides the parsed input. */
+export interface SurfaceCallContext {
+  paseo?: unknown;
+}
+
+/** The structural slice of PaseoApi the surface reads (agent activity counts). */
+export interface SurfaceDaemonApi {
+  agents: {
+    list(options?: { filter?: { includeArchived?: boolean } }): Promise<{ entries: unknown[] }>;
+  };
+}
+
+/** The injection bag: every seam the handlers touch, over one paseo home. */
+export interface SurfaceDeps {
+  paseoHome: string;
+  /** Peer `Fleet pulse` fetcher — defaults to Tailscale SSH (tests stub it). */
+  transport?: PulseTransport;
+  /** Local pulse facts source — defaults to real CPU/RAM sampling (tests stub it). */
+  localSource?: LocalPulseSource;
+  /** Peer artifact reader for `Gossip sync` — defaults to Tailscale SSH (tests stub it). */
+  gossipTransport?: GossipArtifactTransport;
+  /** Bundle mover for `Handoff` — defaults to `scp` over SSH (tests stub it). */
+  bundleTransport?: GitBundleTransport;
+  /** Peer command runner for `Handoff`/`Burst` — defaults to SSH (tests stub it). */
+  remoteRunner?: DispatchRemoteRunner;
+  /** Local command runner for `Burst` on the local `Node` (tests stub it). */
+  localRunner?: CommandRunner;
+  /** Daemon API for local activity counts, when the shell captured one. */
+  daemon?: () => SurfaceDaemonApi | undefined;
+  now?: () => Date;
+  onLog?: (message: string) => void;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function createSurfaceHandlers(deps: SurfaceDeps) {
+  const log = deps.onLog ?? (() => {});
+  const failure = (code: string, error: string) => ({ ok: false as const, code, error });
+
+  /** The current view, folded over the given (or on-disk) pulse snapshot. */
+  const view = (state?: Parameters<typeof foldFleetView>[0]["state"]): FleetView =>
+    foldFleetView({ paseoHome: deps.paseoHome, state, now: deps.now });
+
+  return {
+    async snapshot(_input: {}) {
+      try {
+        return { ok: true as const, view: view() };
+      } catch (error) {
+        return failure("snapshot-failed", messageOf(error));
+      }
+    },
+  };
+}
+
+/** The handlers' shared type — the shell builds them once and registers them. */
+export type SurfaceHandlers = ReturnType<typeof createSurfaceHandlers>;
+
+/**
+ * Registers every `connector.*` handler on the plugin server. Each call
+ * carries the daemon's `context.paseo` through to the handler context.
+ */
+export function registerSurfaceRpc(server: PluginServerContext, handlers: SurfaceHandlers): void {
+  server.handle(snapshot, (input) => handlers.snapshot(input));
+}
