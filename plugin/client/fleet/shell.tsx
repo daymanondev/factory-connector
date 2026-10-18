@@ -119,16 +119,6 @@ function slugify(value: string): string {
   return slug.length > 0 ? slug : "project";
 }
 
-/** CPU guard colour — warning once the digest crosses the threshold. */
-function cpuTone(node: FleetNodeView): "statusSuccess" | "statusWarning" {
-  return node.cpuPercent > node.healthGuard.maxCpuPercent ? "statusWarning" : "statusSuccess";
-}
-
-/** Free-memory guard colour — warning once the digest dips below the floor. */
-function memTone(node: FleetNodeView): "statusSuccess" | "statusWarning" {
-  return node.freeMemMb < node.healthGuard.minFreeMemMb ? "statusWarning" : "statusSuccess";
-}
-
 export function FleetShell({
   theme,
   dir,
@@ -439,9 +429,7 @@ function NodeCard({
         {node.reserveMode ? <Pill theme={theme} label="Reserve mode" tone="statusWarning" lit icon="Pause" /> : null}
       </View>
       <View style={{ flexDirection: "row", gap: SPACING[4], flexWrap: "wrap" }}>
-        <Text style={text(theme, "meta", cpuTone(node))}>CPU {Math.round(node.cpuPercent)}% (guard {Math.round(node.healthGuard.maxCpuPercent)}%)</Text>
-        <Text style={text(theme, "meta", memTone(node))}>free RAM {Math.round(node.freeMemMb)} MB (min {Math.round(node.healthGuard.minFreeMemMb)})</Text>
-        <Text style={text(theme, "meta")}>slots {node.slotsInUse}/{node.slotCeiling}</Text>
+        <Text style={text(theme, "meta")}>slots {Math.max(node.slotsInUse, node.activeBurnRuns)}/{node.slotCeiling}</Text>
         <Text style={text(theme, "meta")}>agents {node.activeAgents} · runs {node.activeBurnRuns}</Text>
       </View>
       {node.meterSummary !== null ? (
@@ -593,8 +581,6 @@ function NodeEditor({
           </>
         ) : null}
         <SettingsInput label="Slot ceiling" initialValue={draft.slotCeiling} onChangeText={(slotCeiling) => field({ slotCeiling })} placeholder="2" />
-        <SettingsInput label="Health guard — max CPU %" initialValue={draft.maxCpuPercent} onChangeText={(maxCpuPercent) => field({ maxCpuPercent })} placeholder="85" />
-        <SettingsInput label="Health guard — min free MB" initialValue={draft.minFreeMemMb} onChangeText={(minFreeMemMb) => field({ minFreeMemMb })} placeholder="2048" />
         <View style={{ flexDirection: "row", alignItems: "center", gap: SPACING[2], flexWrap: "wrap", paddingTop: SPACING[2] }}>
           <Btn theme={theme} small label="Discover Tailscale peers" icon="Search" disabled={busy} onPress={onDiscover} />
           {peers !== null ? <Text style={text(theme, "meta")}>{peers.length} peer(s) found</Text> : null}

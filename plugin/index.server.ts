@@ -27,7 +27,7 @@ import { createSurfaceHandlers, registerSurfaceRpc } from "./server/surface-rpc.
 import type { SurfaceDaemonApi } from "./server/surface-rpc.ts";
 
 const PLUGIN_ID = "factory-connector";
-const SHELL_VERSION = "0.0.1";
+const SHELL_VERSION = "0.0.2";
 
 const log = (message: string) => console.log(`[${PLUGIN_ID}] ${message}`);
 
@@ -58,14 +58,22 @@ export default function contribute(server: PluginServerContext) {
     }
   };
   const offAgentCreated = server.on("agent.created", (_event, context) => capturePaseo(context));
+  const offSessionOpen = server.before("agent.session_open", (_payload, context) => {
+    capturePaseo(context);
+    return undefined;
+  });
 
+  const baseSource = defaultLocalPulseSource(home);
   const localSource: LocalPulseSource = async () => {
-    const sample = await defaultLocalPulseSource()();
+    const sample = await baseSource();
     const api = daemonApi;
     if (api !== undefined) {
       try {
         const page = await api.agents.list({ filter: { includeArchived: false } });
-        sample.activeAgents = page.entries.length;
+        sample.activeAgents = page.entries.filter((entry) => {
+          const item = entry as { status?: string; agent?: { status?: string } };
+          return (item.agent?.status ?? item.status) === "running";
+        }).length;
       } catch {
         // The count is optional — the pulse renders without it.
       }
@@ -111,6 +119,7 @@ export default function contribute(server: PluginServerContext) {
   return () => {
     clearInterval(cadence);
     offAgentCreated();
+    offSessionOpen();
     log(`down v${SHELL_VERSION}`);
   };
 }
