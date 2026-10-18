@@ -555,7 +555,7 @@ describe("executeBurst (cooperative parallel execution)", () => {
       nodeState({ nodeId: "studio-a", name: "Studio A", posture: "stationary", slotCeiling: 2 }),
       nodeState({ nodeId: "studio-b", name: "Studio B", posture: "stationary", slotCeiling: 1 }),
       nodeState({ nodeId: "reserved", name: "Reserved Box", posture: "stationary", reserveMode: true }),
-      nodeState({ nodeId: "hot", name: "Hot Box", posture: "stationary", cpuPercent: 99 }),
+      nodeState({ nodeId: "hot", name: "Hot Box", posture: "stationary", activeBurnRuns: 2, slotCeiling: 2 }),
     ]);
     return { initiatorHome, state };
   }

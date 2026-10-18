@@ -11,7 +11,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -347,22 +347,115 @@ async function sampleCpuPercent(sampleDelayMs = 120): Promise<number> {
   return Math.min(100, Math.max(0, Math.round((busyDelta / allDelta) * 1000) / 10));
 }
 
+const TERMINAL_BURN_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "aborted"]);
+
 /**
- * Production `LocalPulseSource`: real CPU% from two `os.cpus()` samples and
- * free memory from `os.freemem()`. Paseo `Agent`/`Burn run` activity counts are
- * zero until the plugin server layer (which can query the daemon) supplies them.
+ * Inspects `<paseoHome>` for active `Burn run`s (`burn-lab/runs/*.json` and
+ * inbound `connector/handoffs/*.json`) plus the newest `free-pool.json` and
+ * `runs/*.json` timestamps that drive `Gossip sync`.
  */
-export function defaultLocalPulseSource(): LocalPulseSource {
+function readLocalBurnActivity(paseoHome: string): {
+  activeBurnRuns: number;
+  freePoolUpdatedAt: string | null;
+  runsUpdatedAt: string | null;
+} {
+  let freePoolUpdatedAt: string | null = null;
+  try {
+    const parsed = JSON.parse(
+      readFileSync(join(paseoHome, "burn-lab", "free-pool.json"), "utf8"),
+    ) as { updatedAt?: unknown };
+    if (typeof parsed.updatedAt === "string" && !Number.isNaN(Date.parse(parsed.updatedAt))) {
+      freePoolUpdatedAt = parsed.updatedAt;
+    }
+  } catch {
+    // Missing or unreadable free-pool.json simply yields null.
+  }
+
+  const activeRunIds = new Set<string>();
+  let runsUpdatedAt: string | null = null;
+  let newestRunMs = 0;
+
+  try {
+    const runsDir = join(paseoHome, "burn-lab", "runs");
+    for (const file of readdirSync(runsDir)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(readFileSync(join(runsDir, file), "utf8")) as {
+          id?: unknown;
+          status?: unknown;
+          updatedAt?: unknown;
+        };
+        const runId = typeof parsed.id === "string" && parsed.id !== "" ? parsed.id : file.slice(0, -5);
+        if (typeof parsed.status === "string" && !TERMINAL_BURN_RUN_STATUSES.has(parsed.status)) {
+          activeRunIds.add(runId);
+        }
+        if (typeof parsed.updatedAt === "string") {
+          const ms = Date.parse(parsed.updatedAt);
+          if (!Number.isNaN(ms) && ms > newestRunMs) {
+            newestRunMs = ms;
+            runsUpdatedAt = parsed.updatedAt;
+          }
+        }
+      } catch {
+        // Malformed run files are ignored.
+      }
+    }
+  } catch {
+    // No burn-lab/runs directory yet.
+  }
+
+  try {
+    const handoffsDir = join(paseoHome, "connector", "handoffs");
+    for (const file of readdirSync(handoffsDir)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(readFileSync(join(handoffsDir, file), "utf8")) as {
+          direction?: unknown;
+          status?: unknown;
+          runOrTaskId?: unknown;
+          handoffId?: unknown;
+        };
+        if (parsed.direction === "inbound" && parsed.status === "running") {
+          const id =
+            typeof parsed.runOrTaskId === "string" && parsed.runOrTaskId !== ""
+              ? parsed.runOrTaskId
+              : typeof parsed.handoffId === "string"
+                ? parsed.handoffId
+                : file.slice(0, -5);
+          activeRunIds.add(id);
+        }
+      } catch {
+        // Malformed handoff records are ignored.
+      }
+    }
+  } catch {
+    // No connector/handoffs directory yet.
+  }
+
+  return {
+    activeBurnRuns: activeRunIds.size,
+    freePoolUpdatedAt,
+    runsUpdatedAt,
+  };
+}
+
+/**
+ * Production `LocalPulseSource`: inspects `<paseoHome>` for active `Burn run`s
+ * and `Gossip sync` artifact stamps, plus OS CPU/memory telemetry. Running
+ * Paseo `Agent` counts are supplied by the plugin server layer via the daemon API.
+ */
+export function defaultLocalPulseSource(paseoHome?: string): LocalPulseSource {
   return async () => {
     const [cpuPercent, freeMemBytes] = [await sampleCpuPercent(), os.freemem()];
+    const activity = paseoHome !== undefined ? readLocalBurnActivity(paseoHome) : null;
     return {
       cpuPercent,
       freeMemMb: Math.round(freeMemBytes / (1024 * 1024)),
       activeAgents: 0,
-      activeBurnRuns: 0,
+      activeBurnRuns: activity?.activeBurnRuns ?? 0,
       meterSummary: null,
-      freePoolUpdatedAt: null,
-      runsUpdatedAt: null,
+      freePoolUpdatedAt: activity?.freePoolUpdatedAt ?? null,
+      runsUpdatedAt: activity?.runsUpdatedAt ?? null,
     };
   };
 }
@@ -539,7 +632,7 @@ export async function pollFleetPulse(options: {
 
   const localPulse = await collectLocalPulse({
     nodeId: config.localNodeId,
-    source: options.localSource,
+    source: options.localSource ?? defaultLocalPulseSource(options.paseoHome),
     now: options.now,
   });
 
@@ -592,20 +685,18 @@ export interface EligibleNode {
   freeSlots: number;
 }
 
-function passesHealthGuard(node: FleetNodeState): boolean {
-  return (
-    node.cpuPercent <= node.healthGuard.maxCpuPercent &&
-    node.freeMemMb >= node.healthGuard.minFreeMemMb
-  );
+function effectiveBusySlots(node: FleetNodeState): number {
+  return Math.max(node.slotsInUse, node.activeBurnRuns);
 }
 
 /**
  * Filters and ranks candidate `Node`s for `Handoff` or `Burst` against the
- * `Fleet pulse` snapshot. A `Node` is eligible when it is online, not in
- * `Reserve mode`, inside its `Health guard` thresholds (inclusive), and below
- * its `Slot ceiling`. Ranking: `stationary` before `mobile`, then most free
- * slots, then lower CPU, then more free RAM — so `Handoff` naturally prefers
- * `stationary` `Node`s and `Burst` spreads onto the roomiest machines first.
+ * `Fleet pulse` snapshot. Capacity is determined by active workload on the
+ * `Node` (never OS CPU/RAM heuristics): a `Node` is eligible when it is
+ * online, not in `Reserve mode`, and its active workload (`slotsInUse` and
+ * `activeBurnRuns`) is below its `Slot ceiling`. Ranking: `stationary`
+ * before `mobile`, then most free slots, then fewest active burn runs, then
+ * fewest active agents.
  */
 export function selectEligibleNodes(state: FleetState, query: EligibilityQuery): EligibleNode[] {
   const excluded = new Set(query.excludeNodeIds ?? []);
@@ -613,16 +704,19 @@ export function selectEligibleNodes(state: FleetState, query: EligibilityQuery):
     .filter((node) => !excluded.has(node.nodeId))
     .filter((node) => node.online)
     .filter((node) => !node.reserveMode)
-    .filter((node) => passesHealthGuard(node))
-    .filter((node) => node.slotsInUse < node.slotCeiling)
+    .filter((node) => effectiveBusySlots(node) < node.slotCeiling)
     .filter((node) => query.requireStationary !== true || node.posture === "stationary")
-    .map((node) => ({ node, freeSlots: node.slotCeiling - node.slotsInUse }))
+    .map((node) => ({ node, freeSlots: node.slotCeiling - effectiveBusySlots(node) }))
     .sort((a, b) => {
       const postureRank = (entry: EligibleNode) => (entry.node.posture === "stationary" ? 0 : 1);
       if (postureRank(a) !== postureRank(b)) return postureRank(a) - postureRank(b);
       if (a.freeSlots !== b.freeSlots) return b.freeSlots - a.freeSlots;
-      if (a.node.cpuPercent !== b.node.cpuPercent) return a.node.cpuPercent - b.node.cpuPercent;
-      if (a.node.freeMemMb !== b.node.freeMemMb) return b.node.freeMemMb - a.node.freeMemMb;
+      if (a.node.activeBurnRuns !== b.node.activeBurnRuns) {
+        return a.node.activeBurnRuns - b.node.activeBurnRuns;
+      }
+      if (a.node.activeAgents !== b.node.activeAgents) {
+        return a.node.activeAgents - b.node.activeAgents;
+      }
       return a.node.nodeId.localeCompare(b.node.nodeId);
     });
 }

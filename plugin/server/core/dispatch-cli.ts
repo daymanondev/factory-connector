@@ -142,7 +142,7 @@ async function checkNodes(home: string, onlyId?: string): Promise<NodeCheckResul
         return {
           id: node.id,
           ok: true,
-          detail: `online cpu=${pulse.cpuPercent}% freeMem=${pulse.freeMemMb}MB`,
+          detail: `online agents=${pulse.activeAgents} runs=${pulse.activeBurnRuns}`,
         };
       } catch (error) {
         return { id: node.id, ok: false, detail: (error as Error).message };

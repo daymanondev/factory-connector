@@ -319,6 +319,54 @@ describe("Fleet pulse digest (collectLocalPulse)", () => {
     assert.equal(pulse.meterSummary, null);
     assert.ok(!Number.isNaN(Date.parse(pulse.collectedAt)));
   });
+
+  it("reads active burn runs, inbound running handoffs, and gossip stamps from <paseoHome>", async () => {
+    const home = makeTempHome();
+    mkdirSync(join(home, "burn-lab", "runs"), { recursive: true });
+    mkdirSync(join(home, "connector", "handoffs"), { recursive: true });
+
+    writeFileSync(
+      join(home, "burn-lab", "free-pool.json"),
+      JSON.stringify({ updatedAt: "2026-10-18T06:00:00.000Z" }),
+      "utf8",
+    );
+    writeFileSync(
+      join(home, "burn-lab", "runs", "burn-done.json"),
+      JSON.stringify({
+        id: "burn-done",
+        status: "completed",
+        updatedAt: "2026-10-18T05:00:00.000Z",
+      }),
+      "utf8",
+    );
+    writeFileSync(
+      join(home, "burn-lab", "runs", "burn-active.json"),
+      JSON.stringify({
+        id: "burn-active",
+        status: "swarm-running",
+        updatedAt: "2026-10-18T06:30:00.000Z",
+      }),
+      "utf8",
+    );
+    writeFileSync(
+      join(home, "connector", "handoffs", "ho-1.json"),
+      JSON.stringify({
+        handoffId: "ho-1",
+        direction: "inbound",
+        status: "running",
+        runOrTaskId: "task-remote-1",
+      }),
+      "utf8",
+    );
+
+    const pulse = await collectLocalPulse({
+      nodeId: "mac",
+      source: defaultLocalPulseSource(home),
+    });
+    assert.equal(pulse.activeBurnRuns, 2);
+    assert.equal(pulse.freePoolUpdatedAt, "2026-10-18T06:00:00.000Z");
+    assert.equal(pulse.runsUpdatedAt, "2026-10-18T06:30:00.000Z");
+  });
 });
 
 describe("adaptive pulse cadence", () => {
@@ -506,14 +554,13 @@ describe("candidate selection (selectEligibleNodes)", () => {
     return { version: 1, localNodeId: "laptop", updatedAt: "2026-10-17T10:00:00.000Z", nodes };
   }
 
-  it("drops offline, Reserve mode, Health guard violating, and slot-saturated Nodes", () => {
+  it("drops offline, Reserve mode, and workload-saturated Nodes while ignoring OS CPU/RAM heuristics", () => {
     const state = fleetOf([
-      nodeState({ nodeId: "healthy" }),
+      nodeState({ nodeId: "healthy", cpuPercent: 99, freeMemMb: 431 }),
       nodeState({ nodeId: "offline", online: false }),
       nodeState({ nodeId: "reserved", reserveMode: true }),
-      nodeState({ nodeId: "hot-cpu", cpuPercent: 99, healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 } }),
-      nodeState({ nodeId: "low-mem", freeMemMb: 512 }),
-      nodeState({ nodeId: "saturated", slotsInUse: 2, slotCeiling: 2 }),
+      nodeState({ nodeId: "saturated-slots", slotsInUse: 2, slotCeiling: 2 }),
+      nodeState({ nodeId: "saturated-runs", activeBurnRuns: 2, slotCeiling: 2 }),
     ]);
 
     const eligible = selectEligibleNodes(state, { purpose: "burst" });
@@ -524,20 +571,20 @@ describe("candidate selection (selectEligibleNodes)", () => {
     assert.equal(eligible[0].freeSlots, 2);
   });
 
-  it("ranks stationary before mobile, then most free slots, then lower CPU, then more free RAM", () => {
+  it("ranks stationary before mobile, then most free slots, then fewest active burn runs, then fewest active agents", () => {
     const state = fleetOf([
-      nodeState({ nodeId: "mobile-idle", posture: "mobile", cpuPercent: 5, freeMemMb: 16384 }),
-      nodeState({ nodeId: "studio-busy", posture: "stationary", cpuPercent: 80, slotsInUse: 1, slotCeiling: 4 }),
-      nodeState({ nodeId: "studio-hot", posture: "stationary", cpuPercent: 40, slotCeiling: 4 }),
-      nodeState({ nodeId: "studio-cool", posture: "stationary", cpuPercent: 40, slotCeiling: 4, freeMemMb: 16384 }),
+      nodeState({ nodeId: "mobile-idle", posture: "mobile" }),
+      nodeState({ nodeId: "studio-busy", posture: "stationary", slotsInUse: 2, slotCeiling: 4 }),
+      nodeState({ nodeId: "studio-agents", posture: "stationary", activeAgents: 3, slotCeiling: 4 }),
+      nodeState({ nodeId: "studio-idle", posture: "stationary", activeAgents: 0, slotCeiling: 4 }),
     ]);
 
     const eligible = selectEligibleNodes(state, { purpose: "handoff" });
-    // studio-cool vs studio-hot tie on posture/free slots/cpu → more free RAM wins;
-    // studio-busy ranks below both on free slots despite being more idle on CPU.
+    // studio-idle vs studio-agents tie on posture and free slots (4) → fewer activeAgents wins;
+    // studio-busy has 2 free slots → ranks below both stationary peers, above mobile-idle.
     assert.deepEqual(
       eligible.map((entry) => entry.node.nodeId),
-      ["studio-cool", "studio-hot", "studio-busy", "mobile-idle"],
+      ["studio-idle", "studio-agents", "studio-busy", "mobile-idle"],
     );
   });
 
@@ -560,17 +607,18 @@ describe("candidate selection (selectEligibleNodes)", () => {
     assert.equal(eligible[0].freeSlots, 1);
   });
 
-  it("treats Health guard boundaries as inclusive (at-threshold still eligible)", () => {
+  it("accounts for activeBurnRuns when computing remaining freeSlots", () => {
     const state = fleetOf([
       nodeState({
-        nodeId: "at-edge",
-        cpuPercent: 85,
-        freeMemMb: 2048,
-        healthGuard: { maxCpuPercent: 85, minFreeMemMb: 2048 },
+        nodeId: "running-one",
+        activeBurnRuns: 1,
+        slotsInUse: 0,
+        slotCeiling: 2,
       }),
     ]);
     const eligible = selectEligibleNodes(state, { purpose: "burst" });
     assert.equal(eligible.length, 1);
+    assert.equal(eligible[0].freeSlots, 1);
   });
 });
 

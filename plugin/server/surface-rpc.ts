@@ -141,7 +141,7 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
     (await pollFleetPulse({
       paseoHome: deps.paseoHome,
       transport: deps.transport,
-      localSource: deps.localSource ?? defaultLocalPulseSource(),
+      localSource: deps.localSource ?? defaultLocalPulseSource(deps.paseoHome),
       now: deps.now,
     }));
 
@@ -166,7 +166,7 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
           ? await pollFleetPulse({
               paseoHome: deps.paseoHome,
               transport: deps.transport,
-              localSource: deps.localSource ?? defaultLocalPulseSource(),
+              localSource: deps.localSource ?? defaultLocalPulseSource(deps.paseoHome),
               now,
             })
           : (previous as NonNullable<typeof previous>);
@@ -281,7 +281,7 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
         const state = await pollFleetPulse({
           paseoHome: deps.paseoHome,
           transport: deps.transport,
-          localSource: deps.localSource ?? defaultLocalPulseSource(),
+          localSource: deps.localSource ?? defaultLocalPulseSource(deps.paseoHome),
           now: deps.now,
         });
         const registry = new Map(loadFleetConfig(deps.paseoHome).nodes.map((node) => [node.id, node]));

@@ -1,6 +1,6 @@
 {
   "name": "factory-connector",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Companion Paseo plugin for paseo-factory & factory-burn-lab: symmetric peer-to-peer multi-machine Tailscale mesh with Fleet Surface, 1-click Handoff, cooperative Burst, and low-bandwidth Git-native sync.",
   "type": "module",
   "private": true,

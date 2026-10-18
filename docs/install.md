@@ -6,7 +6,7 @@ Every machine in the `Fleet` runs the plugin from its own trial home `~/.paseo-f
 
 ```bash
 paseo plugin install 'https://github.com/daymanondev/factory-connector.git:plugin' \
-  --ref v0.0.1 \
+  --ref v0.0.2 \
   --home ~/.paseo-factory
 ```
 
@@ -27,10 +27,10 @@ Upgrades: re-run the install command with a newer `--ref` (e.g. `v0.0.2`).
 ```bash
 # --path is the legacy spelling of the same suffix
 paseo plugin install https://github.com/daymanondev/factory-connector.git \
-  --ref v0.0.1 --path plugin --home ~/.paseo-factory
+  --ref v0.0.2 --path plugin --home ~/.paseo-factory
 
 # clone + directory source (mirrors the dev machine's registration)
-git clone --branch v0.0.1 https://github.com/daymanondev/factory-connector.git ~/factory-connector
+git clone --branch v0.0.2 https://github.com/daymanondev/factory-connector.git ~/factory-connector
 paseo plugin install ~/factory-connector/plugin --home ~/.paseo-factory
 ```
 
