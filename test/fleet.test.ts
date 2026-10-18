@@ -25,11 +25,15 @@ import {
   createSshPulseTransport,
   parseTailscalePeers,
   discoverTailscalePeers,
+  tailscalePeerToNodeInput,
+  assertAdoptableNodeId,
   type FleetState,
   type FleetNodeState,
   type FleetPulse,
   type PulseTransport,
   type CommandRunner,
+  type TailscalePeer,
+  type FleetConfig,
 } from "../src/fleet.ts";
 
 function makePulse(overrides: Partial<FleetPulse> & { nodeId: string }): FleetPulse {
@@ -712,5 +716,91 @@ describe("Tailscale peer discovery", () => {
     const peers = await discoverTailscalePeers(runner);
     assert.deepEqual(calls, [{ command: "tailscale", args: ["status", "--json"] }]);
     assert.equal(peers.length, 2);
+  });
+});
+
+describe("node adopt (tailscalePeerToNodeInput + assertAdoptableNodeId)", () => {
+  // The live trap this guards: two machines whose hostname is literally "Mac"
+  // both slug to id "mac", and a naive adopt would shadow the local anchor.
+  const peer: TailscalePeer = {
+    id: "mac",
+    name: "Mac",
+    dnsName: "andrews-mac-mini.tailnet.ts.net",
+    tailscaleIp: "100.126.182.99",
+    online: true,
+    os: "macOS",
+  };
+  const config: FleetConfig = {
+    version: 1,
+    localNodeId: "mac",
+    nodes: [
+      {
+        id: "mac",
+        name: "Mac",
+        posture: "mobile",
+        transport: "local",
+        slotCeiling: DEFAULT_SLOT_CEILING,
+        reserveMode: false,
+        healthGuard: { ...DEFAULT_HEALTH_GUARD },
+      },
+    ],
+  };
+
+  it("builds an upsert input from a discovered peer (defaults)", () => {
+    assert.deepEqual(tailscalePeerToNodeInput(peer, { user: "andrewmini" }), {
+      id: "mac",
+      name: "Mac",
+      posture: "mobile",
+      transport: "ssh",
+      sshTarget: "ssh://andrewmini@100.126.182.99",
+    });
+  });
+
+  it("honors explicit id/name/posture overrides (the shared-hostname trap)", () => {
+    assert.deepEqual(
+      tailscalePeerToNodeInput(peer, {
+        user: "andrewmini",
+        posture: "stationary",
+        id: "mac-mini",
+        name: "Mac mini",
+      }),
+      {
+        id: "mac-mini",
+        name: "Mac mini",
+        posture: "stationary",
+        transport: "ssh",
+        sshTarget: "ssh://andrewmini@100.126.182.99",
+      },
+    );
+  });
+
+  it("requires a non-empty SSH user", () => {
+    assert.throws(() => tailscalePeerToNodeInput(peer, { user: "  " }), /non-empty SSH user/);
+  });
+
+  it("refuses adopt ids that shadow the local anchor, allows distinct ones", () => {
+    assert.throws(() => assertAdoptableNodeId(config, "mac"), /collides with the local Node/);
+    assertAdoptableNodeId(config, "mac-mini");
+  });
+
+  it("round-trips an adopted peer through upsertNode", () => {
+    const dir = mkdtempSync(join(tmpdir(), "fc-adopt-"));
+    try {
+      const input = tailscalePeerToNodeInput(peer, {
+        user: "andrewmini",
+        posture: "stationary",
+        id: "mac-mini",
+        name: "Mac mini",
+      });
+      upsertNode(dir, input);
+      const stored = loadFleetConfig(dir).nodes.find((node) => node.id === "mac-mini");
+      assert.ok(stored);
+      assert.equal(stored.transport, "ssh");
+      assert.equal(stored.sshTarget, "ssh://andrewmini@100.126.182.99");
+      assert.equal(stored.posture, "stationary");
+      assert.equal(stored.remotePaseoHome, "~/.paseo-factory");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

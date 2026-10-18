@@ -785,3 +785,46 @@ export async function discoverTailscalePeers(runner: CommandRunner = execCommand
   const { stdout } = await runner.run("tailscale", ["status", "--json"]);
   return parseTailscalePeers(stdout);
 }
+
+/** Options accepted when adopting a discovered Tailscale peer into the registry. */
+export interface PeerAdoptOptions {
+  /** SSH user on the peer — required: pulse fetches run `ssh -o BatchMode=yes user@host`. */
+  user: string;
+  posture?: NodePosture;
+  /** Overrides the hostname-slug id (e.g. when two machines share a hostname). */
+  id?: string;
+  name?: string;
+}
+
+/**
+ * Turns a discovered Tailscale peer into a `FleetNodeInput` for `upsertNode`:
+ * the one-call path from `tailscale discover` to a registered, pollable `Node`.
+ */
+export function tailscalePeerToNodeInput(
+  peer: TailscalePeer,
+  options: PeerAdoptOptions,
+): FleetNodeInput {
+  if (typeof options.user !== "string" || options.user.trim().length === 0) {
+    throw new Error("factory-connector: adopting a Tailscale peer requires a non-empty SSH user");
+  }
+  return {
+    id: options.id ?? peer.id,
+    name: options.name ?? peer.name,
+    posture: options.posture ?? "mobile",
+    transport: "ssh",
+    sshTarget: `ssh://${options.user}@${peer.tailscaleIp}`,
+  };
+}
+
+/**
+ * Guards `node adopt` against the shared-hostname trap: two machines both
+ * named "Mac" both slug to id "mac", and the adopt would shadow the registry's
+ * local anchor. The operator disambiguates with an explicit id override.
+ */
+export function assertAdoptableNodeId(config: FleetConfig, id: string): void {
+  if (id === config.localNodeId) {
+    throw new Error(
+      `factory-connector: adopt id ${JSON.stringify(id)} collides with the local Node id — pass an explicit id override`,
+    );
+  }
+}

@@ -40,4 +40,9 @@ paseo plugin install ~/factory-connector/plugin --home ~/.paseo-factory
 - No Node.js/npm on the peer: the daemon compiles the plugin from the repo's tracked files.
 - Windows `Node`s: run everything inside WSL2 (Ubuntu) for POSIX parity (ADR 0001 §5).
 
-After install: open `Fleet surface` in Paseo Desktop and register the peer `Node` (node editor + Tailscale auto-discovery), then `Fleet pulse` picks it up within 60s (5s while the surface is open).
+After install, register the peer `Node` from either side — the prerequisite both ways is key-based SSH (the pulse runs `ssh -o BatchMode=yes user@host`, so `ssh-copy-id` + `ssh-keyscan` once per direction):
+
+- CLI (scriptable, no Desktop needed): `<paseoHome>/connector/bin/connector-dispatch node adopt --ip <tailscale-ip> --user <ssh-user> [--posture stationary] [--id <override>]` — discovers the peer over Tailscale, registers it, and immediately verifies the pulse fetch (exit 1 with a hint when SSH auth is missing). Use `--id` when both machines share a hostname.
+- Paseo Desktop `Fleet surface`: node editor + Tailscale auto-discovery.
+
+Then `Fleet pulse` picks the peer up within 60s (5s while the surface is open).
