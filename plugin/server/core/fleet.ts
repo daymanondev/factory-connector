@@ -486,7 +486,7 @@ export async function collectLocalPulse(input: {
 export const PULSE_INTERVAL_IDLE_MS = 60_000;
 
 /** Active `Fleet pulse` cadence while the `Fleet surface` is open (5–10s window, ADR 0001 §3). */
-export const PULSE_INTERVAL_ACTIVE_MS = 5_000;
+export const PULSE_INTERVAL_ACTIVE_MS = 10_000;
 
 /** The effective pulse interval for the given surface visibility. */
 export function pulseIntervalMs(activeSurface: boolean): number {
@@ -608,6 +608,18 @@ export function saveFleetState(paseoHome: string, state: FleetState): void {
 }
 
 /**
+ * Options accepted by `pollFleetPulse` (and, verbatim, by its cached wrapper
+ * `pollFleetPulseCached`).
+ */
+export interface PollFleetPulseOptions {
+  paseoHome: string;
+  transport?: PulseTransport;
+  localSource?: LocalPulseSource;
+  fetchTimeoutMs?: number;
+  now?: () => Date;
+}
+
+/**
  * Collects the local `Fleet pulse`, fetches every peer `Node`'s digest through
  * the injectable `PulseTransport` (a failing or timed-out peer is recorded as
  * offline instead of failing the poll), and writes the merged snapshot to
@@ -615,13 +627,7 @@ export function saveFleetState(paseoHome: string, state: FleetState): void {
  * `Connector bridge`. `slotsInUse` values recorded by dispatch are carried
  * over from the previous snapshot.
  */
-export async function pollFleetPulse(options: {
-  paseoHome: string;
-  transport?: PulseTransport;
-  localSource?: LocalPulseSource;
-  fetchTimeoutMs?: number;
-  now?: () => Date;
-}): Promise<FleetState> {
+export async function pollFleetPulse(options: PollFleetPulseOptions): Promise<FleetState> {
   const config = loadFleetConfig(options.paseoHome);
   const transport = options.transport;
   const timeoutMs = options.fetchTimeoutMs ?? PULSE_FETCH_TIMEOUT_MS;
@@ -666,6 +672,66 @@ export async function pollFleetPulse(options: {
   };
   writeJsonAtomic(fleetStatePath(options.paseoHome), state);
   return state;
+}
+
+/**
+ * How long a settled `Fleet pulse` snapshot satisfies new callers without
+ * re-running transports. Half the active poll cadence, so the `Fleet surface`
+ * clock and this cache never disagree about freshness.
+ */
+export const PULSE_CACHE_TTL_MS = 5_000;
+
+type PulseCacheEntry = {
+  inFlight: Promise<FleetState> | null;
+  state: FleetState | null;
+  settledAtMs: number;
+};
+
+/**
+ * Module-level snapshot cache, keyed per `paseoHome` (the trial/prod isolation
+ * law — a trial home and a prod home never share an entry).
+ */
+const pulseCache = new Map<string, PulseCacheEntry>();
+
+/**
+ * `pollFleetPulse` behind an in-memory single-flight + TTL cache: concurrent
+ * callers over one `<paseoHome>` share a single in-flight collection, and a
+ * snapshot younger than `PULSE_CACHE_TTL_MS` is served as-is, with zero
+ * transport runs — the daemon RPC storm prevention for the `Fleet surface`
+ * poll path. A failed poll is never cached: the entry is dropped so the next
+ * caller retries immediately.
+ */
+export function pollFleetPulseCached(options: PollFleetPulseOptions): Promise<FleetState> {
+  const clock = options.now ?? (() => new Date());
+  const existing = pulseCache.get(options.paseoHome);
+  const entry: PulseCacheEntry = existing ?? { inFlight: null, state: null, settledAtMs: 0 };
+  if (existing === undefined) {
+    pulseCache.set(options.paseoHome, entry);
+  }
+  if (entry.state !== null && clock().getTime() - entry.settledAtMs < PULSE_CACHE_TTL_MS) {
+    return Promise.resolve(entry.state);
+  }
+  if (entry.inFlight !== null) {
+    return entry.inFlight;
+  }
+  const inFlight = pollFleetPulse(options).then(
+    (state) => {
+      entry.inFlight = null;
+      entry.state = state;
+      entry.settledAtMs = clock().getTime();
+      return state;
+    },
+    (error: unknown) => {
+      // Never cache a failure — drop the entry (only if it is still this one)
+      // so the next caller starts a fresh collection.
+      if (pulseCache.get(options.paseoHome) === entry) {
+        pulseCache.delete(options.paseoHome);
+      }
+      throw error;
+    },
+  );
+  entry.inFlight = inFlight;
+  return inFlight;
 }
 
 /** What the caller is selecting candidates for. */

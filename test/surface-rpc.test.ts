@@ -355,7 +355,7 @@ describe("connector.pulse", () => {
     assert.ok(existsSync(join(home, "connector", "fleet-state.json")));
   });
 
-  it("gates repeat polls on the adaptive cadence — 5s while the surface is open, 60s idle", async () => {
+  it("gates repeat polls on the adaptive cadence — 10s while the surface is open, 60s idle", async () => {
     const home = makeTempHome("pulse-cadence");
     seedRegistry(home, [fleetNode({ id: "studio-a" })]);
     const { calls, transport } = stubTransport({ "studio-a": {} });
@@ -370,8 +370,8 @@ describe("connector.pulse", () => {
     await handlers.pulse({ activeSurface: false });
     assert.equal(polled(), 1, "idle gate holds for 60s");
 
-    await handlers.pulse({ activeSurface: true }); // +30s: past the 5s active window
-    assert.equal(polled(), 2, "an open surface tightens the cadence to 5s");
+    await handlers.pulse({ activeSurface: true }); // +30s: past the 10s active window
+    assert.equal(polled(), 2, "an open surface tightens the cadence to 10s");
 
     await handlers.pulse({ activeSurface: false }); // 0s since the last poll
     assert.equal(polled(), 2, "the idle gate re-applies the moment the surface closes");
@@ -379,6 +379,36 @@ describe("connector.pulse", () => {
     clock = new Date("2026-10-17T10:01:31.000Z"); // +61s since the last poll
     await handlers.pulse({ activeSurface: false });
     assert.equal(polled(), 3, "the idle cadence polls again after 60s");
+  });
+
+  it("deduplicates concurrent polls into a single transport sweep (single-flight cache)", async () => {
+    const home = makeTempHome("pulse-single-flight");
+    seedRegistry(home, [fleetNode({ id: "studio-a" })]);
+    const calls: string[] = [];
+    const releases: Array<() => void> = [];
+    const transport: PulseTransport = {
+      fetchPulse: (node) =>
+        new Promise((resolve) => {
+          calls.push(node.id);
+          releases.push(() => resolve(pulseOf(node.id)));
+        }),
+    };
+    const handlers = makeHandlers(home, { transport });
+
+    // Both calls are due (no snapshot exists yet) and in flight at the same
+    // time — they must share one collection, not race two transport sweeps.
+    const replies = Promise.all([
+      handlers.pulse({ activeSurface: true }),
+      handlers.pulse({ activeSurface: true }),
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const release of releases.splice(0)) release();
+    const [first, second] = await replies;
+
+    assert.equal(first.ok, true);
+    assert.equal(second.ok, true);
+    assert.deepEqual(calls, ["studio-a"], "concurrent pulse calls share one in-flight collection");
+    assert.ok(existsSync(join(home, "connector", "fleet-state.json")));
   });
 });
 

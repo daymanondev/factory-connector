@@ -18,6 +18,7 @@ import {
   loadFleetConfig,
   loadFleetState,
   pollFleetPulse,
+  pollFleetPulseCached,
   removeNode,
   setNodeReserveMode,
   shouldPollNow,
@@ -135,10 +136,14 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
   const view = (state?: Parameters<typeof foldFleetView>[0]["state"]): FleetView =>
     foldFleetView({ paseoHome: deps.paseoHome, state, now: deps.now });
 
-  /** The freshest snapshot there is — the on-disk one, or a first poll. */
+  /**
+   * The freshest snapshot there is — the on-disk one, or a first poll (through
+   * the single-flight TTL cache, so a concurrent `connector.pulse` never races
+   * a second transport sweep).
+   */
   const currentState = async (): Promise<FleetState> =>
     loadFleetState(deps.paseoHome) ??
-    (await pollFleetPulse({
+    (await pollFleetPulseCached({
       paseoHome: deps.paseoHome,
       transport: deps.transport,
       localSource: deps.localSource ?? defaultLocalPulseSource(deps.paseoHome),
@@ -162,8 +167,11 @@ export function createSurfaceHandlers(deps: SurfaceDeps) {
           activeSurface: input.activeSurface === true,
           nowMs: now().getTime(),
         });
+        // `shouldPollNow` stays the cadence law on top; the due poll itself
+        // runs through the single-flight TTL cache so concurrent callers share
+        // one in-flight collection.
         const state = due
-          ? await pollFleetPulse({
+          ? await pollFleetPulseCached({
               paseoHome: deps.paseoHome,
               transport: deps.transport,
               localSource: deps.localSource ?? defaultLocalPulseSource(deps.paseoHome),

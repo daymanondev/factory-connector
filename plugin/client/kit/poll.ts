@@ -1,6 +1,6 @@
 /**
  * The `Fleet surface`'s poll clock — the reference surface's usePoll trimmed
- * to the Fleet pulse cadence: 5s while the surface is open (the component is
+ * to the Fleet pulse cadence: 10s while the surface is open (the component is
  * mounted), 60s when it goes quiet. Keeps the last good view on errors and
  * restarts when the reload key changes. No `document` reference survives on
  * Hermes (the typeof guard), no node built-ins.
@@ -8,7 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 
 /** `Fleet pulse` cadence while the `Fleet surface` is open (ADR 0001 §3: 5–10s). */
-export const FLEET_ACTIVE_MS = 5000;
+export const FLEET_ACTIVE_MS = 10_000;
 
 /** Fallback quiet cadence — matches the server's idle gate. */
 export const FLEET_QUIET_MS = 60000;
