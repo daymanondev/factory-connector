@@ -18,6 +18,8 @@ import {
   PULSE_INTERVAL_ACTIVE_MS,
   PULSE_INTERVAL_IDLE_MS,
   pollFleetPulse,
+  pollFleetPulseCached,
+  PULSE_CACHE_TTL_MS,
   loadFleetState,
   fleetStatePath,
   selectEligibleNodes,
@@ -370,11 +372,11 @@ describe("Fleet pulse digest (collectLocalPulse)", () => {
 });
 
 describe("adaptive pulse cadence", () => {
-  it("uses 60s background and 5s active-surface intervals", () => {
+  it("uses 60s background and 10s active-surface intervals", () => {
     assert.equal(PULSE_INTERVAL_IDLE_MS, 60_000);
-    assert.equal(PULSE_INTERVAL_ACTIVE_MS, 5_000);
+    assert.equal(PULSE_INTERVAL_ACTIVE_MS, 10_000);
     assert.equal(pulseIntervalMs(false), 60_000);
-    assert.equal(pulseIntervalMs(true), 5_000);
+    assert.equal(pulseIntervalMs(true), 10_000);
   });
 
   it("polls immediately without prior state, then respects the idle/active windows", () => {
@@ -392,9 +394,9 @@ describe("adaptive pulse cadence", () => {
     assert.equal(shouldPollNow(state, { activeSurface: false, nowMs: t0 + 59_999 }), false);
     assert.equal(shouldPollNow(state, { activeSurface: false, nowMs: t0 + 60_000 }), true);
 
-    // Active Fleet surface window (5s).
-    assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 4_999 }), false);
-    assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 5_000 }), true);
+    // Active Fleet surface window (10s).
+    assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 9_999 }), false);
+    assert.equal(shouldPollNow(state, { activeSurface: true, nowMs: t0 + 10_000 }), true);
   });
 });
 
@@ -524,6 +526,173 @@ describe("Fleet pulse polling (pollFleetPulse → fleet-state.json)", () => {
   it("loadFleetState returns null when no snapshot exists yet", () => {
     const home = makeTempHome();
     assert.equal(loadFleetState(home), null);
+  });
+});
+
+describe("snapshot single-flight TTL cache (pollFleetPulseCached)", () => {
+  function cacheHome(): string {
+    const home = makeTempHome();
+    upsertNode(home, {
+      id: "mac-studio",
+      name: "Mac Studio",
+      posture: "stationary",
+      sshTarget: "ssh://andrew@100.101.102.103?daemonPort=6767",
+    });
+    upsertNode(home, {
+      id: "win-wsl",
+      name: "Windows WSL2",
+      posture: "stationary",
+    });
+    return home;
+  }
+
+  const cacheLocalSource = async () => ({
+    cpuPercent: 30,
+    freeMemMb: 6144,
+    activeAgents: 2,
+  });
+
+  it("pins the cache TTL at 5s", () => {
+    assert.equal(PULSE_CACHE_TTL_MS, 5_000);
+  });
+
+  it("shares one in-flight collection across concurrent callers (single-flight)", async () => {
+    const home = cacheHome();
+    let fetches = 0;
+    let localCalls = 0;
+    const releases: Array<() => void> = [];
+    const transport: PulseTransport = {
+      fetchPulse: (node) =>
+        new Promise((resolve) => {
+          fetches += 1;
+          releases.push(() => resolve(makePulse({ nodeId: node.id })));
+        }),
+    };
+    const localSource = async () => {
+      localCalls += 1;
+      return { cpuPercent: 30, freeMemMb: 6144 };
+    };
+
+    const calls = [
+      pollFleetPulseCached({ paseoHome: home, transport, localSource }),
+      pollFleetPulseCached({ paseoHome: home, transport, localSource }),
+      pollFleetPulseCached({ paseoHome: home, transport, localSource }),
+    ];
+    // Let the initiating poll reach (and park on) the deferred peer fetches.
+    await new Promise((resolve) => setImmediate(resolve));
+    for (const release of releases.splice(0)) release();
+    const [first, second, third] = await Promise.all(calls);
+
+    assert.equal(fetches, 2, "one transport sweep for all concurrent callers (one per peer Node)");
+    assert.equal(localCalls, 1, "the local pulse is collected exactly once");
+    assert.deepEqual(second, first);
+    assert.deepEqual(third, first);
+  });
+
+  it("serves a poll younger than the TTL from cache without re-running transports", async () => {
+    const home = cacheHome();
+    const t0 = Date.parse("2026-10-17T10:00:00.000Z");
+    let clockMs = t0;
+    const now = () => new Date(clockMs);
+    let fetches = 0;
+    let localCalls = 0;
+    const transport: PulseTransport = {
+      fetchPulse: async (node) => {
+        fetches += 1;
+        return makePulse({ nodeId: node.id });
+      },
+    };
+    const localSource = async () => {
+      localCalls += 1;
+      return { cpuPercent: 30, freeMemMb: 6144 };
+    };
+
+    const first = await pollFleetPulseCached({ paseoHome: home, transport, localSource, now });
+    clockMs = t0 + 4_999; // one millisecond inside the TTL window
+    const cached = await pollFleetPulseCached({ paseoHome: home, transport, localSource, now });
+
+    assert.equal(fetches, 2, "only the first collection ever touched the transport");
+    assert.equal(localCalls, 1);
+    assert.equal(cached.updatedAt, first.updatedAt, "the cached snapshot is the fresh poll's");
+  });
+
+  it("re-collects once the TTL has expired", async () => {
+    const home = cacheHome();
+    const t0 = Date.parse("2026-10-17T10:00:00.000Z");
+    let clockMs = t0;
+    const now = () => new Date(clockMs);
+    let fetches = 0;
+    const transport: PulseTransport = {
+      fetchPulse: async (node) => {
+        fetches += 1;
+        return makePulse({ nodeId: node.id });
+      },
+    };
+
+    await pollFleetPulseCached({ paseoHome: home, transport, localSource: cacheLocalSource, now });
+    clockMs = t0 + 5_000; // the TTL elapses — the poll is no longer "younger than 5s"
+    const fresh = await pollFleetPulseCached({
+      paseoHome: home,
+      transport,
+      localSource: cacheLocalSource,
+      now,
+    });
+
+    assert.equal(fetches, 4, "a full new transport sweep ran (both peers again)");
+    assert.equal(fresh.updatedAt, new Date(t0 + 5_000).toISOString());
+  });
+
+  it("keys the cache per paseoHome — trial and prod homes never share a snapshot", async () => {
+    const homeA = cacheHome();
+    const homeB = cacheHome();
+    let fetchesB = 0;
+    const transportA: PulseTransport = {
+      fetchPulse: async (node) => makePulse({ nodeId: node.id }),
+    };
+    const transportB: PulseTransport = {
+      fetchPulse: async (node) => {
+        fetchesB += 1;
+        return makePulse({ nodeId: node.id });
+      },
+    };
+
+    const a = await pollFleetPulseCached({
+      paseoHome: homeA,
+      transport: transportA,
+      localSource: cacheLocalSource,
+    });
+    const b = await pollFleetPulseCached({
+      paseoHome: homeB,
+      transport: transportB,
+      localSource: cacheLocalSource,
+    });
+
+    assert.ok(a.nodes.some((node) => node.nodeId === "mac-studio"));
+    assert.ok(b.nodes.some((node) => node.nodeId === "mac-studio"));
+    // homeB ran its own collection over its own registry — it was never served
+    // homeA's cached snapshot (an unkeyed cache would answer with 0 fetches).
+    assert.equal(fetchesB, 2);
+  });
+
+  it("never caches a failed poll — the next caller retries the collection", async () => {
+    const home = cacheHome();
+    mkdirSync(join(home, "connector"), { recursive: true });
+    writeFileSync(fleetConfigPath(home), "{ not json", "utf8");
+
+    await assert.rejects(() =>
+      pollFleetPulseCached({ paseoHome: home, localSource: cacheLocalSource }),
+    );
+
+    // Repair the registry: the same paseoHome must collect, not re-throw a cached failure.
+    rmSync(fleetConfigPath(home));
+    upsertNode(home, { id: "mac-studio", name: "Mac Studio", posture: "stationary" });
+    upsertNode(home, { id: "win-wsl", name: "Windows WSL2", posture: "stationary" });
+    const state = await pollFleetPulseCached({
+      paseoHome: home,
+      transport: { fetchPulse: async (node) => makePulse({ nodeId: node.id }) },
+      localSource: cacheLocalSource,
+    });
+    assert.equal(state.nodes.length, 3);
   });
 });
 

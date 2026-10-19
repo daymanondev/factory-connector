@@ -2,7 +2,7 @@
  * factory-connector plugin server entry — the shell around the connector core.
  *
  * The plugin process owns the background `Fleet pulse` cadence (60s idle; the
- * UI's `connector.pulse` calls tighten it to 5s while the `Fleet surface` is
+ * UI's `connector.pulse` calls tighten it to 10s while the `Fleet surface` is
  * open) and keeps the `Connector bridge` fresh: at boot it writes
  * `<paseoHome>/connector/fleet-state.json` and generates the executable
  * `<paseoHome>/connector/bin/connector-dispatch` wrapper that `paseo-factory`
