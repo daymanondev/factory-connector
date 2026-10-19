@@ -1,7 +1,7 @@
 /**
  * The one `<FleetShell />` every `Fleet surface` entry renders: the global
  * screen and the workspace panel — one component, two hosts. It owns the
- * `Fleet pulse` poll (5s while mounted, ADR 0001 §3) and every RPC action
+ * `Fleet pulse` poll (10s while mounted, ADR 0001 §3) and every RPC action
  * (`Reserve mode` toggles, `Node` registration/removal, the 1-click `Handoff`
  * launcher, `Gossip sync`, `Fleet ref` `Land`). Function components only — no
  * class syntax reaches the Hermes bundle.
