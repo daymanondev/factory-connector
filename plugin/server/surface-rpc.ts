@@ -49,7 +49,7 @@ export interface SurfaceCallContext {
 /** The structural slice of PaseoApi the surface reads (agent activity counts). */
 export interface SurfaceDaemonApi {
   agents: {
-    list(options?: { filter?: { includeArchived?: boolean } }): Promise<{ entries: unknown[] }>;
+    list(options?: { filter?: { includeArchived?: boolean; includeBackground?: boolean } }): Promise<{ entries: unknown[] }>;
   };
 }
 

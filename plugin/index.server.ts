@@ -27,7 +27,7 @@ import { createSurfaceHandlers, registerSurfaceRpc } from "./server/surface-rpc.
 import type { SurfaceDaemonApi } from "./server/surface-rpc.ts";
 
 const PLUGIN_ID = "factory-connector";
-const SHELL_VERSION = "0.0.2";
+const SHELL_VERSION = "0.0.4";
 
 const log = (message: string) => console.log(`[${PLUGIN_ID}] ${message}`);
 
@@ -69,7 +69,7 @@ export default function contribute(server: PluginServerContext) {
     const api = daemonApi;
     if (api !== undefined) {
       try {
-        const page = await api.agents.list({ filter: { includeArchived: false } });
+        const page = await api.agents.list({ filter: { includeArchived: false, includeBackground: true } });
         sample.activeAgents = page.entries.filter((entry) => {
           const item = entry as { status?: string; agent?: { status?: string } };
           return (item.agent?.status ?? item.status) === "running";
