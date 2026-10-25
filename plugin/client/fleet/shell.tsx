@@ -8,8 +8,7 @@
  */
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
-import { SettingsInput, SettingsSelect } from "@getpaseo/plugin/client/ui";
-import { Modal, useToast } from "@getpaseo/plugin/client/react-native";
+import { Modal, SettingsInput, SettingsSelect, useToast } from "@getpaseo/plugin/client/ui";
 import { useState } from "react";
 import { ScrollView, Text, View } from "react-native";
 import {

@@ -1,6 +1,6 @@
 {
   "name": "factory-connector",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Companion Paseo plugin for paseo-factory & factory-burn-lab: symmetric peer-to-peer multi-machine Tailscale mesh with Fleet Surface, 1-click Handoff, cooperative Burst, and low-bandwidth Git-native sync.",
   "type": "module",
   "private": true,
@@ -19,7 +19,7 @@
     "check:bundle": "node scripts/check-bundle.mjs"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.11.2",
+    "@getpaseo/plugin": "0.13.0",
     "@types/node": "^22.10.0",
     "@types/react": "19.2.18",
     "esbuild": "0.25.12",

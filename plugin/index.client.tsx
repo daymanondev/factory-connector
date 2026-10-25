@@ -17,7 +17,6 @@ export default function contribute(client: PluginClientContext) {
       id: "factory-connector",
       title: "Fleet",
       icon: "Network",
-      context: "workspace",
       locations: ["explorer", "workspace"],
       Component: FleetPanel,
     }),

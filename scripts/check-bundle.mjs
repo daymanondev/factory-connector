@@ -132,6 +132,7 @@ function bundle(entry, target) {
     mainFields: target === "client" ? ["module", "main"] : undefined,
     supported: target === "client" ? { "async-await": false } : undefined,
     external: target === "client" ? [...SDK, "@tanstack/react-query", "react", "react/jsx-runtime", "react-native", "zod"] : [...SDK, "zod"],
+    loader: { ".svg": "text" },
     plugins: [boundary(target)],
     logLevel: "silent",
     treeShaking: true,
